@@ -1,0 +1,222 @@
+---
+title: "Untitled"
+format: html
+editor: visual
+---
+
+## Load dataset
+
+```{r}
+library(gtsummary)
+library(tidyr)
+library(data.table)
+library(ggplot2)
+library(dplyr)
+# find the dataset
+datadir <- "msk_chord_2024/"
+
+# Load the datasets:
+clin_patient <- fread(paste0(datadir, "data_clinical_patient.txt"), skip = 4) 
+# PATIENT_ID, CANCER_TYPE
+clin_sample  <- fread(paste0(datadir, "data_clinical_sample.txt"), skip = 4)
+#OS_MONTHS, OS_STATUS, CURRENT_AGE_DEID, GENDER, STAGE_HIGHEST_RECORDED, SMOKING_PREDICTIONS_3_CLASSES
+
+muta <- fread(paste0(datadir, "data_mutations.txt"))
+# TP53, KRAS, EGFR (canonical genes)
+# ALK, BRAF, STK11, KEAP1, PIK3CA,MET, ERBB2, ROS1 (driver panel)
+
+muta_with_patient <- merge(
+    muta,
+    clin_sample[, .(SAMPLE_ID, PATIENT_ID, CANCER_TYPE)],
+    by.x = "Tumor_Sample_Barcode",
+    by.y = "SAMPLE_ID",
+    all.x = TRUE
+  )
+
+treat <- fread(paste0(datadir, "data_timeline_treatment.txt"))
+
+cancer_pred <- fread(paste0(datadir, "data_timeline_cancer_presence.txt"))
+cancer_diag <- fread(paste0(datadir, "data_timeline_diagnosis.txt"))
+```
+
+## NSCLC
+
+### Data cleaning
+
+#### 1. keep only the dataset and rows that related to nsclc
+
+```{r}
+# Select patient ID with non-small cell lung cancer
+pID_nsclc <- unique(clin_sample$PATIENT_ID[clin_sample$CANCER_TYPE == "Non-Small Cell Lung Cancer"])
+
+clin_patient_nsclc <- clin_patient %>% filter(PATIENT_ID %in% pID_nsclc)
+# GENDER + CURRENT_AGE_DEID + SMOKING_PREDICTIONS_3_CLASSES
+# OS_MONTHS + OS_STATUS + PRIOR_MED_TO_MSK
+
+clin_sample_nsclc <- clin_sample %>% filter(CANCER_TYPE == "Non-Small Cell Lung Cancer")
+
+cancer_diag_nsclc <- cancer_diag %>% filter(PATIENT_ID %in% pID_nsclc)
+# START_DATE + EVENT_TYPE + STAGE_CDM_DERIVED
+
+# Check duplication:
+test <- cancer_diag_nsclc[duplicated(cancer_diag_nsclc$PATIENT_ID) | duplicated(cancer_diag_nsclc$PATIENT_ID, fromLast = TRUE), ]
+
+# 1. have multiple records 
+# 2. In DX_DESCRIPTION there is no "LUNG"; 
+# 3. If a patient has multiple records after the first two filters, keep only the first one with the smallest START_DATE value
+
+cancer_diag_nsclc <- cancer_diag_nsclc %>%
+  group_by(PATIENT_ID) %>% 
+  # 1 & 2. Eliminate records if the patient has > 1 record AND "LUNG" isn't in the description
+  # We use filter() to keep the rows that DON'T meet your "unwanted" criteria
+  filter(!(n() > 1 & !grepl("LUNG", DX_DESCRIPTION, ignore.case = TRUE))) %>%
+  # 3. If a patient still has multiple records (e.g., two different "LUNG" entries),
+  # keep only the one with the smallest (earliest) START_DATE
+  arrange(START_DATE, .by_group = TRUE) %>%
+  slice(1) %>%
+  ungroup()
+
+muta_with_patient_nsclc <-  muta_with_patient %>% filter(PATIENT_ID %in% pID_nsclc)
+# Hugo_Symbol + CANCER_TYPE
+```
+
+#### 2. calculate the time variable and event variable needed for the cox model (only clinical features)
+
+```{r}
+# make event variable as 0 or 1 (censored/alive or dead)
+nsclc_combined <- clin_patient_nsclc %>%
+  inner_join(cancer_diag_nsclc, by = "PATIENT_ID") %>%
+  mutate(event = ifelse(grepl("1:DECEASED", OS_STATUS), 1, 0))
+
+nsclc_combined <- nsclc_combined %>%
+  mutate(
+    age_at_diagnosis = CURRENT_AGE_DEID - (abs(START_DATE) / 365.25),
+
+    entry_time = ifelse(START_DATE < 0, abs(START_DATE), 0) / 30.44, 
+    exit_time = OS_MONTHS
+  ) %>%
+  # Filter: You must exist (sequencing) before you die (event)
+  filter(exit_time > entry_time, !is.na(entry_time), !is.na(exit_time))
+
+# Check missingness after the cleaning
+nsclc_combined %>%
+  select(everything()) %>%  # replace to your needs
+  summarize(across(everything(), ~ sum(is.na(.))))
+```
+
+#### 3. Categorical variable adjustment
+
+```{r}
+# Select the clinical information will be used
+nsclc_combined_clin <- nsclc_combined %>% select(
+  PATIENT_ID, GENDER, age_at_diagnosis, STAGE_CDM_DERIVED, SMOKING_PREDICTIONS_3_CLASSES,
+  PRIOR_MED_TO_MSK, event, entry_time, exit_time
+)
+
+# Adjust categorical variables 
+nsclc_combined_clin <- nsclc_combined_clin %>%
+  mutate(
+    smoke_f = factor(SMOKING_PREDICTIONS_3_CLASSES),
+    stage_f = factor(STAGE_CDM_DERIVED),
+    prior_med_to_msk_f = factor(PRIOR_MED_TO_MSK)
+  )
+```
+
+#### 4. Add core genomic information:
+
+```{r}
+genomic_features <- muta_with_patient_nsclc %>%
+  mutate(mutation = 1) %>% # create a binary indicator (1 = mutated)
+  # keep only unique patient-gene pairs
+  distinct(PATIENT_ID, Hugo_Symbol, .keep_all = T) %>% 
+  pivot_wider(
+    id_cols = PATIENT_ID,
+    names_from = Hugo_Symbol,
+    values_from = mutation,
+    values_fill = 0 # fills missing genes with 0 if the patient is in this list
+  )
+
+# Merge the clinical data with genomic dataset
+nsclc_final_nsclc <- nsclc_combined_clin %>% 
+  left_join(genomic_features, by = "PATIENT_ID") %>%
+  mutate(across(c(KRAS, EGFR, TP53), ~replace_na(., 0)))
+```
+
+### Prelimary presentation:
+
+#### 1. summary table for clinical features for nsclc
+
+```{r}
+# Create a summary table for clinical features
+table_clinical <- nsclc_combined_clin %>%
+  select(GENDER, age_at_diagnosis, STAGE_CDM_DERIVED, SMOKING_PREDICTIONS_3_CLASSES, PRIOR_MED_TO_MSK) %>% # Remove ID from the table
+  tbl_summary(
+    by = GENDER, # Optional: Split the table by Gender to show balance
+    label = list(
+      age_at_diagnosis ~ "Age at Diagnosis",
+      STAGE_CDM_DERIVED ~ "Stage at Diagnosis",
+      SMOKING_PREDICTIONS_3_CLASSES ~ "Smoking Status",
+      PRIOR_MED_TO_MSK ~ "Prior Medication Status"
+    ),
+    statistic = list(all_continuous() ~ "{median} ({p25}, {p75})"),
+    missing = "ifany"
+  ) %>%
+  add_overall() %>%
+  bold_labels() %>%
+  modify_header(label = "**Patient Demographics**")
+
+# To view it in RStudio
+table_clinical
+```
+
+#### 2. clinical features graph
+
+```{r}
+library(patchwork)
+
+# Plot A: Age Distribution
+p1 <- ggplot(nsclc_combined_clin, aes(x = age_at_diagnosis)) +
+  geom_histogram(fill = "lightpink", color = "white", bins = 20) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1)) +
+  labs(title = "Age at Diagnosis", x = "Age", y = "Count")
+
+# Plot B: Smoking Status (Bar Chart)
+p2 <- ggplot(nsclc_combined_clin, aes(x = SMOKING_PREDICTIONS_3_CLASSES, fill = SMOKING_PREDICTIONS_3_CLASSES)) +
+  geom_bar() +
+  coord_flip() + # Makes it easier to read labels
+  theme_minimal() +
+  theme(legend.position = "none") +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1)) +
+  labs(title = "Smoking History", x = "", y = "Patients")
+
+# Plot C: Cancer Stage
+p3 <- ggplot(nsclc_combined_clin, aes(x = STAGE_CDM_DERIVED, fill = STAGE_CDM_DERIVED)) +
+  geom_bar() +
+  theme_minimal() +
+  theme(legend.position = "none") +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1)) +
+  labs(title = "Stage at Diagnosis", x = "Stage", y = "Count")
+
+
+p4 <- ggplot(nsclc_combined_clin, aes(x = PRIOR_MED_TO_MSK, fill = PRIOR_MED_TO_MSK)) +
+  geom_bar() +
+  scale_x_discrete(labels = c("Prior Med", "No Med", "Unknown"))+
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1)) +
+  labs(title = "Prior Medication", x = "Status", y = "Count")
+
+# Combine them into a layout
+dashboard <- (p3 | p2) / (p1 | p4)
+dashboard + plot_annotation(title = "NSCLC Cohort Overview (N = 7802)")
+```
+
+
+```{r}
+#library(readr)
+#write.csv(nsclc_final_nsclc, "nsclc.csv")
+```
+
+
+
+
