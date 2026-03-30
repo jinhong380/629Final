@@ -1,0 +1,555 @@
+---
+title: "NSCLC_Modeling_3"
+format: pdf
+editor: visual
+---
+
+(Number of altered genes in the pathway for the patient) / (Total number of genes in that KEGG pathway).
+
+## Setups
+
+```{r}
+library(dplyr)
+library(glmnet)
+library(survminer)
+library(ggplot2)
+library(survival)
+nsclc <- read.csv("nsclc.csv") # read in the dataset
+
+# Adjusting factor variables
+# Adjusting factor variables
+nsclc <- nsclc %>% mutate(
+  stage_f = as.factor(stage_f),
+  smoke_f = as.factor(smoke_f),
+  prior_med_f = as.factor(prior_med_to_msk_f),
+  gender = ifelse(GENDER == "Female", 1 ,0) # change Female to 1, and male to 0
+) %>% select(-c(
+  "GENDER", "STAGE_CDM_DERIVED", 
+  "SMOKING_PREDICTIONS_3_CLASSES", "PRIOR_MED_TO_MSK"
+))
+
+# 1. Define clinical columns to isolate the gene matrix
+
+clinical_cols <- c(
+
+  "X", "PATIENT_ID", "age_at_diagnosis",  "event", 
+
+  "entry_time", "exit_time", "smoke_f", "stage_f", "prior_med_to_msk_f", 
+
+  "prior_med_f", "gender"
+
+)
+```
+
+## Data Processing
+
+```{r}
+# install.packages("msigdbr")
+library(msigdbr)
+library(tibble)
+
+# 1. Pull KEGG pathways from MSigDB
+# C2 category, CP:KEGG subcategory contains all KEGG pathways
+kegg_data <- msigdbr(
+  species = "Homo sapiens", 
+  collection = "C2", 
+  subcollection = "CP:KEGG_LEGACY"
+)
+# 2. Convert to a list where each element is a pathway containing its gene symbols
+kegg_list <- split(x = kegg_data$gene_symbol, f = kegg_data$gs_name)
+
+# 3. Create an empty list to store the fractional scores for each pathway
+pathway_scores <- list()
+
+# 4. Loop through each KEGG pathway to calculate the fraction
+for (pathway_name in names(kegg_list)) {
+  
+  # Get the unique genes in this specific KEGG pathway
+  pathway_genes <- unique(kegg_list[[pathway_name]])
+  total_genes_in_pathway <- length(pathway_genes)
+  
+  # Find which of these pathway genes are actually measured in our NSCLC dataset
+  # (gene_cols was defined in your Step 1)
+  intersecting_genes <- intersect(pathway_genes, gene_cols)
+  
+  # If we have at least one gene from this pathway in our dataset:
+  if (length(intersecting_genes) > 0) {
+    
+    # Sum the mutations (0s and 1s) across the intersecting genes for each patient
+    # rowSums handles this perfectly across the isolated columns
+    patient_mutations <- rowSums(gene_matrix[, intersecting_genes, drop = FALSE], na.rm = TRUE)
+    
+    # Calculate the fraction: (Altered genes) / (Total genes in KEGG pathway)
+    fraction <- patient_mutations / total_genes_in_pathway
+    
+    # Store in our list
+    pathway_scores[[pathway_name]] <- fraction
+  }
+}
+
+# 5. Combine the list into a dataframe
+pathway_matrix <- bind_cols(pathway_scores)
+
+# 6. Filter out pathways with zero variance (no patients had mutations in them)
+pathway_df <- colSums(pathway_matrix, na.rm = TRUE)
+active_pathways <- names(pathway_df[pathway_df > 0])
+pathway_matrix_filtered <- pathway_matrix[, active_pathways]
+
+# 7. Recombine with your clinical data
+nsclc_pathway <- bind_cols(nsclc[, clinical_cols], pathway_matrix_filtered)
+
+cat("Total KEGG Pathways evaluated:", length(kegg_list), "\n")
+cat("Pathways with at least 1 mutation in cohort:", length(active_pathways), "\n")
+```
+
+2. Prepare data for glmnet
+
+```{r}
+library(tidyr)
+
+# 1. Create a complete dataset (dropping NAs to align x and y)
+nsclc_path_complete <- nsclc_pathway %>% drop_na()
+
+# 2. Isolate the predictor variables (removing survival/ID columns)
+x_vars_path <- nsclc_path_complete %>% 
+  select(-X, -PATIENT_ID, -entry_time, -exit_time, -event)
+
+# 3. Create the predictor matrix (handling dummy variables for clinical factors)
+x_matrix_path <- model.matrix(~ . - 1, data = x_vars_path)
+
+# 4. Create the Survival response object
+y_surv_path <- Surv(
+  time = nsclc_path_complete$entry_time, 
+  time2 = nsclc_path_complete$exit_time, 
+  event = nsclc_path_complete$event
+)
+```
+
+## 1. Cross-validation with Lasso
+
+```{r}
+set.seed(629)
+
+# Fit the Cross-Validated Lasso Cox Model using Pathway features
+cv_lasso_path <- cv.glmnet(
+  x = x_matrix_path,
+  y = y_surv_path,
+  family = "cox",
+  alpha = 1,          
+  type.measure = "C"  
+)
+
+plot(cv_lasso_path)
+title("LASSO Penalty on KEGG Pathways", line = 2.5)
+
+cat("Optimal Lambda:", cv_lasso_path$lambda.min, "\n")
+cat("Max CV C-index (Pathways):", max(cv_lasso_path$cvm, na.rm = TRUE), "\n")
+
+# Extract the winning pathway features
+lasso_coefs_path <- coef(cv_lasso_path, s = "lambda.min")
+active_features_path <- rownames(lasso_coefs_path)[which(lasso_coefs_path != 0)]
+
+cat("Features selected by LASSO:", length(active_features_path), "\n\n")
+
+# View the selected features and weights
+selected_weights_path <- lasso_coefs_path[active_features_path, , drop = FALSE]
+print(selected_weights_path)
+```
+
+### Post-lasso Unpenalized Cox Model
+
+```{r}
+# 1. Identify ONLY the pathways that LASSO selected
+selected_pathways <- active_features_path[active_features_path %in% colnames(pathway_matrix_filtered)]
+
+# --- DIAGNOSTIC CHECK ---
+# Check if any selected pathways have essentially 0 variance in the COMPLETE dataset
+# If a pathway has only 0s, scale() will fail and coxph will crash.
+pathway_variances <- apply(nsclc_path_complete[, selected_pathways, drop=FALSE], 2, var)
+valid_pathways <- names(pathway_variances[pathway_variances > 0])
+
+if(length(valid_pathways) < length(selected_pathways)) {
+  cat("Dropped", length(selected_pathways) - length(valid_pathways), 
+      "pathways due to zero variance in the clean dataset.\n")
+}
+
+# 2. Build final data frame
+final_model_data_path <- nsclc_path_complete %>%
+  select(
+    entry_time, exit_time, event,   
+    age_at_diagnosis, smoke_f, stage_f, prior_med_f, gender, 
+    all_of(valid_pathways)         
+  ) %>%
+  # FIX 1: Standardize the continuous pathway fractions (Z-scores)
+  # This makes the optimization algorithm much happier
+  mutate(across(all_of(valid_pathways), ~ as.numeric(scale(.))))
+
+# 3. Run the final Cox model
+clean_cox_model_path <- coxph(
+  Surv(entry_time, exit_time, event) ~ .,
+  data = final_model_data_path,
+  # FIX 2: Give the algorithm 100 iterations instead of the default 20
+  control = coxph.control(iter.max = 100) 
+)
+
+# Check the output (and check if the warning is gone!)
+summary(clean_cox_model_path)
+```
+### C-index
+
+```{r}
+# Setup CV
+set.seed(629)
+K <- 5
+n_path <- nrow(final_model_data_path)
+fold_id_path <- sample(rep(1:K, length.out = n_path))
+cv_cindex_post_lasso_path <- numeric(K)
+
+for(k in 1:K){
+  
+  train_data_path <- final_model_data_path[fold_id_path != k, ]
+  test_data_path  <- final_model_data_path[fold_id_path == k, ]
+  
+  # Fit the post-LASSO model on the training fold 
+  # (Using iter.max = 100 to prevent convergence warnings on smaller folds)
+  fit_path <- coxph(
+    Surv(entry_time, exit_time, event) ~ .,
+    data = train_data_path,
+    control = coxph.control(iter.max = 100)
+  )
+  
+  # Predict risk scores on the test fold
+  test_data_path$risk_score <- predict(fit_path, newdata = test_data_path, type = "lp", na.action = na.pass)
+  
+  # Compute C-index on the test fold
+  c_obj_path <- concordance(
+    Surv(entry_time, exit_time, event) ~ risk_score,
+    data = test_data_path,
+    reverse = TRUE
+  )
+  
+  cv_cindex_post_lasso_path[k] <- c_obj_path$concordance
+}
+
+# Print results
+cat("Pathway Model Mean CV C-index:", mean(cv_cindex_post_lasso_path, na.rm = TRUE), "\n")
+cat("Pathway Model SD CV C-index:", sd(cv_cindex_post_lasso_path, na.rm = TRUE), "\n")
+```
+
+### Time-Dependent ROC Curve
+
+```{r}
+library(timeROC)
+
+# 1. Generate the risk scores (linear predictors) from your final pathway model
+final_model_data_path$risk_score <- predict(clean_cox_model_path, type = "lp")
+
+# 2. Define the time horizon (80th percentile of follow-up time)
+time_horizon_path <- quantile(final_model_data_path$exit_time, 0.80)
+
+# 3. Calculate the Time-dependent ROC
+roc_pathway <- timeROC(
+  T = final_model_data_path$exit_time,
+  delta = final_model_data_path$event,
+  marker = final_model_data_path$risk_score, 
+  cause = 1,
+  times = time_horizon_path,
+  iid = TRUE # Keeps the data needed to calculate Confidence Intervals
+)
+
+# 4. Extract the Area Under the Curve (AUC) and Confidence Intervals
+auc_value_path <- roc_pathway$AUC[2] # Index 2 corresponds to time_horizon_path
+se_value_path <- roc_pathway$inference$vect_sd_1[2]
+
+# Calculate 95% CI
+ci_lower_path <- auc_value_path - 1.96 * se_value_path
+ci_upper_path <- auc_value_path + 1.96 * se_value_path
+
+cat("Time Horizon:", round(time_horizon_path, 2), "\n")
+cat("Pathway AUC at Time Horizon:", round(auc_value_path, 3), "\n")
+cat("95% CI: [", round(ci_lower_path, 3), "-", round(ci_upper_path, 3), "]\n\n")
+
+# 5. Plot the ROC Curve
+{plot(roc_pathway, 
+     time = time_horizon_path, 
+     col = "darkblue", # Changed color to visually distinguish from your gene model
+     lwd = 2, 
+     title = FALSE)
+
+# Add a reference line and a title
+abline(0, 1, lty = 2, col = "gray50")
+title(main = paste("Pathway Cox Model ROC\nat Time =", round(time_horizon_path, 1)))
+
+# Add a legend with the AUC value
+legend("bottomright", 
+       legend = paste0("AUC = ", round(auc_value_path, 2), 
+                       " (", round(ci_lower_path, 2), "-", round(ci_upper_path, 2), ")"),
+       col = "darkblue", 
+       lwd = 2, 
+       bty = "n")}
+```
+
+### calibration plot
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(survival)
+
+# 1. Define the time horizon (80th percentile of follow-up time, same as ROC)
+time_horizon_path <- quantile(final_model_data_path$exit_time, 0.80)
+
+# 2. Calculate predicted survival probabilities for the entire cohort at the time horizon
+sf_final_path <- survfit(clean_cox_model_path, newdata = final_model_data_path)
+pred_surv_path <- summary(sf_final_path, times = time_horizon_path)$surv
+pred_surv_path <- as.numeric(pred_surv_path)
+
+# 3. Add predictions to the dataset
+final_model_data_path$pred_surv <- pred_surv_path
+
+# 4. Create 10 risk groups (deciles) based on predicted survival
+# Note: If your dataset is small, you might want to use 5 groups (ntile(..., 5)) instead
+final_model_data_path$decile <- ntile(final_model_data_path$pred_surv, 10)
+
+# 5. Calculate observed Kaplan-Meier estimates for each decile
+calibration_data_path <- final_model_data_path %>%
+  group_by(decile) %>%
+  group_modify(~ {
+    
+    km_fit <- survfit(Surv(entry_time, exit_time, event) ~ 1, data = .x)
+    
+    # extend = TRUE ensures we get an estimate even if the last event in a decile 
+    # happened slightly before the time horizon
+    km_summary <- summary(km_fit, 
+                          times = time_horizon_path, 
+                          extend = TRUE)
+    
+    data.frame(
+      mean_pred = mean(.x$pred_surv, na.rm = TRUE),
+      km_est = km_summary$surv
+    )
+  })
+
+# 6. Plot the calibration curve
+ggplot(calibration_data_path, aes(x = mean_pred, y = km_est)) +
+  geom_point(size = 3, color = "darkblue") +
+  geom_line(color = "darkblue") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+  scale_x_continuous(limits = c(0, 1), breaks = seq(0, 1, 0.2)) + 
+  scale_y_continuous(limits = c(0, 1), breaks = seq(0, 1, 0.2)) +
+  labs(
+    x = "Predicted Survival Probability",
+    y = "Observed Survival Probability (Kaplan-Meier)",
+    title = "Calibration Plot: Pathway-Based Post-LASSO Cox Model",
+    subtitle = paste("Evaluated at Time =", round(time_horizon_path, 1), "| Red dashed line = perfect calibration")
+  ) +
+  theme_minimal()
+```
+
+### 2. Left-truncated random forest
+
+#### 1. Setup and Data Cleaning
+
+```{r}
+# install.packages("LTRCforests")
+library(LTRCforests)
+library(dplyr)
+library(survival)
+
+# 1. Clean the dataset to ensure the forest only sees true predictors
+# We drop the prediction columns generated during the Cox evaluation
+rsf_data <- final_model_data_path %>%
+  select(-any_of(c("risk_score", "pred_surv", "decile")))
+
+# 2. Define the time horizon (same as before)
+time_horizon_path <- quantile(rsf_data$exit_time, 0.80)
+```
+
+#### 2. Cross-Validated C-Index (LTRC Forest)
+
+```{r}
+set.seed(629)
+
+rsf_data <- as.data.frame(rsf_data)
+predictor_names <- setdiff(colnames(rsf_data), c("entry_time", "exit_time", "event"))
+
+# This stitches them together into: Surv(entry_time, exit_time, event) ~ age + gender + KEGG_...
+rsf_formula <- as.formula(paste("Surv(entry_time, exit_time, event) ~", 
+                                paste(predictor_names, collapse = " + ")))
+
+
+K <- 5
+n_rsf <- nrow(rsf_data)
+fold_id_rsf <- sample(rep(1:K, length.out = n_rsf))
+cv_cindex_rsf <- numeric(K)
+
+for(k in 1:K){
+  
+  train_data_rsf <- rsf_data[fold_id_rsf != k, ]
+  test_data_rsf  <- rsf_data[fold_id_rsf == k, ]
+  
+  # Fit the forest using our explicit formula
+  fit_rsf <- ltrcrrf(
+    formula = rsf_formula, # Using the exact formula we built above
+    data = train_data_rsf,
+    ntree = 500,        
+  nodesize = 20,      
+  mtry = 3,           # Rule of thumb: sqrt(number of predictors)
+  nsplit = 10         # Randomly chooses 10 split points per variable to save time
+  )
+  
+  # Predict survival probabilities at the specific time horizon
+  pred_obj <- predictProb(
+    fit_rsf, 
+    newdata = test_data_rsf, 
+    time.eval = time_horizon_path
+  )
+  
+  # Extract the survival probabilities 
+  test_data_rsf$rsf_risk <- 1-as.numeric(pred_obj$survival.probs)
+  
+  # Compute C-index on the test fold
+  c_obj_rsf <- concordance(
+    Surv(entry_time, exit_time, event) ~ rsf_risk,
+    data = test_data_rsf,
+    reverse = TRUE
+  )
+  
+  cv_cindex_rsf[k] <- c_obj_rsf$concordance
+}
+
+# Print results
+cat("LTRC Forest Mean CV C-index:", mean(cv_cindex_rsf, na.rm = TRUE), "\n")
+cat("LTRC Forest SD CV C-index:", sd(cv_cindex_rsf, na.rm = TRUE), "\n")
+```
+#### time-dependent ROC:
+
+```{r}
+library(timeROC)
+
+# 1. Fit the final LTRC Forest on the whole cohort
+final_rsf_model <- ltrcrrf(
+  formula = rsf_formula, # Use the explicit formula here too!
+  data = rsf_data,
+  ntree = 500 ,        
+  nodesize = 20,      
+  mtry = 3,           # Rule of thumb: sqrt(number of predictors)
+  nsplit = 10         # Randomly chooses 10 split points per variable to save time
+)
+
+
+# 2. Generate survival probabilities for the whole cohort
+final_pred_obj <- predictProb(
+  final_rsf_model, 
+  newdata = rsf_data, 
+  time.eval = time_horizon_path
+)
+
+# 3. Add the risk score to our dataset
+rsf_data$rsf_risk <- 1 - as.numeric(final_pred_obj$survival.probs)
+rsf_data$pred_surv <- as.numeric(final_pred_obj$survival.probs)
+
+# 4. Calculate the Time-dependent ROC
+roc_rsf <- timeROC(
+  T = rsf_data$exit_time,
+  delta = rsf_data$event,
+  marker = rsf_data$rsf_risk, 
+  cause = 1,
+  times = time_horizon_path,
+  iid = TRUE
+)
+
+# 5. Extract AUC and CI
+auc_value_rsf <- roc_rsf$AUC[2] 
+se_value_rsf <- roc_rsf$inference$vect_sd_1[2]
+ci_lower_rsf <- auc_value_rsf - 1.96 * se_value_rsf
+ci_upper_rsf <- auc_value_rsf + 1.96 * se_value_rsf
+
+cat("LTRC Forest AUC at Time Horizon:", round(auc_value_rsf, 3), "\n")
+cat("95% CI: [", round(ci_lower_rsf, 3), "-", round(ci_upper_rsf, 3), "]\n\n")
+
+# 6. Plot the ROC Curve
+{plot(roc_rsf, 
+     time = time_horizon_path, 
+     col = "darkorange", # Unique color for the Random Forest
+     lwd = 2, 
+     title = FALSE)
+
+abline(0, 1, lty = 2, col = "gray50")
+title(main = paste("LTRC Random Forest ROC\nat Time =", round(time_horizon_path, 1)))
+
+legend("bottomright", 
+       legend = paste0("AUC = ", round(auc_value_rsf, 2), 
+                       " (", round(ci_lower_rsf, 2), "-", round(ci_upper_rsf, 2), ")"),
+       col = "darkorange", 
+       lwd = 2, 
+       bty = "n")}
+```
+
+
+#### calibration plot:
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(survival)
+
+# 1. Define the time horizon (80th percentile of follow-up time, same as ROC)
+time_horizon_path <- quantile(rsf_data$exit_time, 0.80)
+
+# 2. Calculate predicted survival probabilities for the entire cohort at the time horizon
+# Using predictProb for the LTRC Forest instead of survfit
+final_pred_obj <- predictProb(
+  final_rsf_model, 
+  newdata = rsf_data, 
+  time.eval = time_horizon_path
+)
+# Safely extract as numeric to avoid the dimension error
+pred_surv_rsf <- as.numeric(final_pred_obj$survival.probs)
+
+# 3. Add predictions to the dataset
+rsf_data$pred_surv <- pred_surv_rsf
+
+# 4. Create 10 risk groups (deciles) based on predicted survival
+# Note: If your dataset is small, you might want to use 5 groups (ntile(..., 5)) instead
+rsf_data$decile <- ntile(rsf_data$pred_surv, 10)
+
+# 5. Calculate observed Kaplan-Meier estimates for each decile
+calibration_data_rsf <- rsf_data %>%
+  group_by(decile) %>%
+  group_modify(~ {
+    
+    km_fit <- survfit(Surv(entry_time, exit_time, event) ~ 1, data = .x)
+    
+    # extend = TRUE ensures we get an estimate even if the last event in a decile 
+    # happened slightly before the time horizon
+    km_summary <- summary(km_fit, 
+                          times = time_horizon_path, 
+                          extend = TRUE)
+    
+    data.frame(
+      mean_pred = mean(.x$pred_surv, na.rm = TRUE),
+      km_est = km_summary$surv
+    )
+  })
+
+# 6. Plot the calibration curve
+ggplot(calibration_data_rsf, aes(x = mean_pred, y = km_est)) +
+  geom_point(size = 3, color = "navy") +
+  geom_line(color = "navy") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+  scale_x_continuous(limits = c(0, 1), breaks = seq(0, 1, 0.2)) + 
+  scale_y_continuous(limits = c(0, 1), breaks = seq(0, 1, 0.2)) +
+  labs(
+    x = "Predicted Survival Probability",
+    y = "Observed Survival Probability (Kaplan-Meier)",
+    title = "Calibration Plot: LTRC Relative Risk Forest",
+    subtitle = paste("Evaluated at Time =", round(time_horizon_path, 1), "| Red dashed line = perfect calibration")
+  ) +
+  theme_minimal()
+```
+
+
+
+
+

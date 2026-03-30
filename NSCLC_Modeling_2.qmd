@@ -1,0 +1,345 @@
+---
+title: "NSCLC_Modeling_2"
+format: pdf
+editor: visual
+---
+
+## Setups
+
+```{r}
+library(dplyr)
+library(survminer)
+library(ggplot2)
+library(survival)
+nsclc <- read.csv("nsclc.csv") # read in the dataset
+
+# Adjusting factor variables
+# Adjusting factor variables
+nsclc <- nsclc %>% mutate(
+  stage_f = as.factor(stage_f),
+  smoke_f = as.factor(smoke_f),
+  prior_med_f = as.factor(prior_med_to_msk_f),
+  gender = ifelse(GENDER == "Female", 1 ,0) # change Female to 1, and male to 0
+) %>% select(-c(
+  "GENDER", "STAGE_CDM_DERIVED", 
+  "SMOKING_PREDICTIONS_3_CLASSES", "PRIOR_MED_TO_MSK"
+))
+```
+
+## 1. Cox - Rarity weight
+
+```{r}
+# 1. Define clinical columns to isolate the gene matrix
+clinical_cols <- c(
+  "X", "PATIENT_ID", "age_at_diagnosis",  "event", 
+  "entry_time", "exit_time", "smoke_f", "stage_f", "prior_med_to_msk_f", 
+  "prior_med_f", "gender"
+)
+
+# Isolate the true gene columns
+gene_cols <- setdiff(colnames(nsclc), clinical_cols)
+gene_matrix <- nsclc %>%
+  select(all_of(gene_cols)) %>%
+  mutate(across(everything(), ~ as.numeric(as.character(.)))) 
+
+# 2. Calculate N and df 
+N <- nrow(gene_matrix)
+df <- colSums(gene_matrix, na.rm = TRUE) 
+
+# 3. Handle zero-variance genes
+# If a gene has 0 mutations, log(N/0) equals Infinity. We must drop them.
+# It is also highly recommended to drop "singletons" (genes mutated in only 1 or 2 patients) 
+# to prevent the Cox model from overfitting to a single patient's outcome.
+min_mutations <- 3 
+genes_to_keep_tfidf <- names(df[df >= min_mutations])
+
+# Subset matrix and frequencies to kept genes
+gene_matrix_filtered <- gene_matrix[, genes_to_keep_tfidf]
+df_filtered <- df[df >= min_mutations]
+
+# 4. Calculate the IDF Weights
+idf_weights <- log(N / df_filtered)
+
+# 5. Apply weights (TF * IDF)
+# sweep() multiplies each column in the matrix by its corresponding IDF weight
+# If patient = 1 (mutated), they get 1 * IDF_weight. If 0, they get 0.
+gene_matrix_weighted <- sweep(
+  x = gene_matrix_filtered, 
+  MARGIN = 2, 
+  STATS = idf_weights, 
+  FUN = "*"
+)
+
+# 6. Recombine with clinical data
+nsclc_tfidf <- bind_cols(nsclc[, clinical_cols], gene_matrix_weighted)
+
+# Check your results
+cat("Total patients (N):", N, "\n")
+cat("Genes evaluated:", length(gene_cols), "\n")
+cat("Genes kept for TF-IDF (>= 3 mutations):", length(genes_to_keep_tfidf), "\n")
+```
+
+### Data Preparation for glmnet
+
+```{r}
+library(glmnet)
+
+# 1. Isolate the predictor variables
+x_vars <- nsclc_tfidf %>% 
+  select(-X, -PATIENT_ID, -entry_time, -exit_time, -event)
+
+# 2. Create the predictor matrix
+# The '~ . - 1' tells R to create dummy variables for your factors but omit the intercept
+# (Cox models don't use a standard intercept in the x matrix)
+x_matrix <- model.matrix(~ . - 1, data = x_vars)
+
+# 3. Create the Survival response object
+# glmnet accepts standard Surv() objects for the 'cox' family
+y_surv <- Surv(
+  time = nsclc_tfidf$entry_time, 
+  time2 = nsclc_tfidf$exit_time, 
+  event = nsclc_tfidf$event
+)
+```
+
+### data cleaning
+
+```{r}
+library(tidyr)
+
+# 1. Create a complete dataset with NO missing values
+# This guarantees x and y will be perfectly aligned
+nsclc_complete <- nsclc_tfidf %>% drop_na()
+
+# 2. Isolate the predictor variables from the COMPLETE dataset
+x_vars <- nsclc_complete %>% 
+  select(-X, -PATIENT_ID, -entry_time, -exit_time, -event)
+
+# 3. Create the predictor matrix
+x_matrix <- model.matrix(~ . - 1, data = x_vars)
+
+# 4. Create the Survival response object from the SAME complete dataset
+y_surv <- Surv(
+  time = nsclc_complete$entry_time, 
+  time2 = nsclc_complete$exit_time, 
+  event = nsclc_complete$event
+)
+```
+
+
+### fit cross-validated lasso model
+
+```{r}
+# Set seed for reproducibility in cross-validation
+set.seed(629)
+
+# Fit the Cross-Validated Lasso Cox Model
+cv_lasso_cox <- cv.glmnet(
+  x = x_matrix,
+  y = y_surv,
+  family = "cox",
+  alpha = 1,          # alpha = 1 specifies LASSO (alpha = 0 would be Ridge)
+  type.measure = "C"  # Optimize the penalty to maximize the Harrell's C-index
+)
+
+# Plot the cross-validation curve
+# This shows the C-index on the y-axis against the log(lambda) penalty on the x-axis
+plot(cv_lasso_cox)
+
+# Print the performance metrics
+cat("Optimal Lambda (maximizes C-index):", cv_lasso_cox$lambda.min, "\n")
+cat("Max Cross-Validated C-index:", max(cv_lasso_cox$cvm, na.rm = TRUE), "\n")
+```
+### Extract the "Winning" Features
+
+
+```{r}
+# Extract the coefficients at the optimal lambda value
+lasso_coefs <- coef(cv_lasso_cox, s = "lambda.min")
+
+# Filter for features that have a non-zero coefficient
+active_features <- rownames(lasso_coefs)[which(lasso_coefs != 0)]
+
+cat("Total features evaluated:", ncol(x_matrix), "\n")
+cat("Features selected by LASSO:", length(active_features), "\n\n")
+
+# View the final selected features and their weights
+selected_weights <- lasso_coefs[active_features, , drop = FALSE]
+print(selected_weights)
+```
+### Post-LASSO unpenalized Cox model.
+
+```{r}
+# 1. Identify ONLY the genes that LASSO selected
+# We do this by cross-referencing the active features with your original gene list
+selected_genes <- active_features[active_features %in% gene_cols]
+
+# 2. Build a new dataframe using the ORIGINAL clinical columns + the winning genes
+# This brings back your proper factor variables (stage_f, prior_med_f, etc.)
+final_model_data_clean <- nsclc_complete %>%
+  select(
+    entry_time, exit_time, event,   # Survival outcomes
+    age_at_diagnosis, smoke_f, stage_f, prior_med_f, gender, # Clinical vars
+    all_of(selected_genes)          # Winning genes
+  )
+
+# 3. Run the final Cox model
+# R will automatically handle the dummy coding behind the scenes
+clean_cox_model <- coxph(
+  Surv(entry_time, exit_time, event) ~ .,
+  data = final_model_data_clean
+)
+
+# Check the beautiful, NA-free output
+summary(clean_cox_model)
+```
+
+
+### c-index
+
+```{r}
+
+# Setup CV
+set.seed(629)
+K <- 5
+n <- nrow(final_model_data_clean)
+fold_id <- sample(rep(1:K, length.out = n))
+cv_cindex_post_lasso <- numeric(K)
+
+for(k in 1:K){
+  
+  train_data <- final_model_data_clean[fold_id != k, ]
+  test_data  <- final_model_data_clean[fold_id == k, ]
+  
+  # Fit the post-LASSO model on the training fold 
+  fit <- coxph(
+    Surv(entry_time, exit_time, event) ~ .,
+    data = train_data
+  )
+  
+  # Predict risk scores on the test fold
+  test_data$risk_score <- predict(fit, newdata = test_data, type = "lp", na.action = na.pass)
+  
+  # Compute C-index on the test fold
+  c_obj <- concordance(
+    Surv(entry_time, exit_time, event) ~ risk_score,
+    data = test_data,
+    reverse = TRUE
+  )
+  
+  cv_cindex_post_lasso[k] <- c_obj$concordance
+}
+
+# Print results
+cat("Post-LASSO Mean C-index:", mean(cv_cindex_post_lasso, na.rm = TRUE), "\n")
+cat("Post-LASSO SD C-index:", sd(cv_cindex_post_lasso, na.rm = TRUE), "\n")
+```
+
+
+
+### calibration plot:
+
+```{r}
+library(ggplot2)
+
+# Define the time horizon (e.g., 80th percentile of follow-up time)
+time_horizon <- quantile(final_model_data_clean$exit_time, 0.80)
+
+# Calculate predicted survival probabilities for the entire cohort at the time horizon
+sf_final <- survfit(clean_cox_model, newdata = final_model_data_clean)
+pred_surv <- summary(sf_final, times = time_horizon)$surv
+pred_surv <- as.numeric(pred_surv)
+
+# Add predictions to the dataset
+final_model_data_clean$pred_surv <- pred_surv
+
+# Create 10 risk groups (deciles) based on predicted survival
+final_model_data_clean$decile <- ntile(final_model_data_clean$pred_surv, 10)
+
+# Calculate observed Kaplan-Meier estimates for each decile
+calibration_data <- final_model_data_clean %>%
+  group_by(decile) %>%
+  group_modify(~ {
+    
+    km_fit <- survfit(Surv(entry_time, exit_time, event) ~ 1, data = .x)
+    
+    km_summary <- summary(km_fit, 
+                          times = time_horizon, 
+                          extend = TRUE)
+    
+    data.frame(
+      mean_pred = mean(.x$pred_surv, na.rm = TRUE),
+      km_est = km_summary$surv
+    )
+  })
+
+# Plot the calibration curve
+ggplot(calibration_data, aes(x = mean_pred, y = km_est)) +
+  geom_point(size = 3, color = "darkblue") +
+  geom_line(color = "darkblue") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+  scale_x_continuous(limits = c(0, 1), breaks = seq(0, 1, 0.2)) + 
+  scale_y_continuous(limits = c(0, 1), breaks = seq(0, 1, 0.2)) +
+  labs(
+    x = "Predicted Survival Probability",
+    y = "Observed Survival Probability (Kaplan-Meier)",
+    title = "Calibration Plot: Post-LASSO Cox Model",
+    subtitle = "Red dashed line indicates perfect calibration"
+  ) +
+  theme_minimal()
+```
+
+### Time-Dependent ROC Curve
+
+```{r}
+library(timeROC)
+
+# 1. Generate the risk scores (linear predictors) from your final model
+# We use the clean model and dataset from the previous step
+final_model_data_clean$risk_score <- predict(clean_cox_model, type = "lp")
+
+# 2. Define the time horizon (same as your calibration plot)
+time_horizon <- quantile(final_model_data_clean$exit_time, 0.80)
+
+# 3. Calculate the Time-dependent ROC
+roc_post_lasso <- timeROC(
+  T = final_model_data_clean$exit_time,
+  delta = final_model_data_clean$event,
+  marker = final_model_data_clean$risk_score, 
+  cause = 1,
+  times = time_horizon,
+  iid = TRUE # Keeps the data needed to calculate Confidence Intervals
+)
+
+# 4. Extract the Area Under the Curve (AUC) and Confidence Intervals
+auc_value <- roc_post_lasso$AUC[2] # Index 2 corresponds to the time_horizon we passed
+se_value <- roc_post_lasso$inference$vect_sd_1[2]
+
+# Calculate 95% CI
+ci_lower <- auc_value - 1.96 * se_value
+ci_upper <- auc_value + 1.96 * se_value
+
+cat("Time Horizon:", round(time_horizon, 2), "\n")
+cat("AUC at Time Horizon:", round(auc_value, 3), "\n")
+cat("95% CI: [", round(ci_lower, 3), "-", round(ci_upper, 3), "]\n\n")
+
+# 5. Plot the ROC Curve
+{plot(roc_post_lasso, 
+     time = time_horizon, 
+     col = "darkblue", 
+     lwd = 2, 
+     title = FALSE)
+
+# Add a reference line and a title
+abline(0, 1, lty = 2, col = "gray50")
+title(main = paste("Post-LASSO Cox Model ROC\nat Time =", round(time_horizon, 1)))
+
+# Add a legend with the AUC value
+legend("bottomright", 
+       legend = paste0("AUC = ", round(auc_value, 2), 
+                       " (", round(ci_lower, 2), "-", round(ci_upper, 2), ")"),
+       col = "darkblue", 
+       lwd = 2, 
+       bty = "n")}
+```
+

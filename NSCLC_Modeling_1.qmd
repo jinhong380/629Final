@@ -1,0 +1,261 @@
+---
+title: "NSCLC_Modeling"
+format: pdf
+editor: visual
+---
+
+## Setups
+
+```{r}
+library(dplyr)
+library(survminer)
+library(ggplot2)
+library(survival)
+nsclc <- read.csv("nsclc.csv") # read in the dataset
+
+# Adjusting factor variables
+nsclc <- nsclc %>% mutate(
+  stage_f = as.factor(stage_f),
+  smoke_f = as.factor(smoke_f),
+  prior_med_f = as.factor(prior_med_to_msk_f),
+  gender = ifelse(GENDER == "Female", 1 ,0) # change Female to 1, and male to 0
+) %>% select(-c(
+  "GENDER", "STAGE_CDM_DERIVED", 
+  "SMOKING_PREDICTIONS_3_CLASSES", "PRIOR_MED_TO_MSK"
+))
+
+```
+
+## 1. Cox - Frequency Filtering: 
+
+1. Drop any gene mutation that occurs in less than < 3% of the cohort.
+
+```{r}
+# Define threshold
+threshold <- 0.03
+
+# clinical/demographics columns to be kept
+clinical_cols <- c(
+  "X", "PATIENT_ID", "age_at_diagnosis",  "event", 
+  "entry_time", "exit_time", "smoke_f", "stage_f", "prior_med_to_msk_f", 
+  "prior_med_f", "gender"
+)
+
+# select all gene columns
+gene_cols <- setdiff(colnames(nsclc), clinical_cols)
+
+# calculate the mutation frequency for all genes
+gene_frequencies <- colMeans(nsclc[, gene_cols], na.rm = TRUE)
+
+# identify genes meet or exceed the threshold
+genes_to_keep <- names(gene_frequencies[gene_frequencies >= threshold])
+
+# dataset with the clinical columns + the filtered genes
+final_cols <- c(clinical_cols, genes_to_keep)
+nsclc_filtered <- nsclc[, final_cols]
+
+# check how many genes were dropped vs. kept
+cat("Original number of genes:", length(gene_cols), "\n")
+cat("Genes kept (>= 3%):", length(genes_to_keep), "\n")
+cat("Genes dropped:", length(gene_cols) - length(genes_to_keep), "\n")
+```
+
+### cox ph model:
+
+```{r}
+library(tidyr)
+library(glmnet)
+
+# Drop missing values so x and y matrices align perfectly
+nsclc_filtered_complete <- nsclc_filtered %>% drop_na()
+
+# Create the predictor matrix and survival object
+x_vars_freq <- nsclc_filtered_complete %>% 
+  select(-X, -PATIENT_ID, -entry_time, -exit_time, -event)
+x_matrix_freq <- model.matrix(~ . - 1, data = x_vars_freq)
+
+y_surv_freq <- Surv(
+  time = nsclc_filtered_complete$entry_time, 
+  time2 = nsclc_filtered_complete$exit_time, 
+  event = nsclc_filtered_complete$event
+)
+
+# Run Cross-Validated LASSO
+set.seed(629)
+cv_lasso_freq <- cv.glmnet(
+  x = x_matrix_freq, 
+  y = y_surv_freq, 
+  family = "cox", 
+  alpha = 1, 
+  type.measure = "C"
+)
+```
+
+
+### Extract winning features and isolate just the genes
+```{r}
+lasso_coefs_freq <- coef(cv_lasso_freq, s = "lambda.min")
+active_features_freq <- rownames(lasso_coefs_freq)[which(lasso_coefs_freq != 0)]
+selected_genes_freq <- active_features_freq[active_features_freq %in% genes_to_keep]
+
+cat("Frequency Filter + LASSO selected", length(selected_genes_freq), "genes.\n")
+```
+
+### Post-LASSO Cox Model
+```{r}
+# Build clean dataset avoiding the dummy-variable trap for clinical factors
+final_data_freq <- nsclc_filtered_complete %>%
+  select(
+    entry_time, exit_time, event, 
+    age_at_diagnosis, smoke_f, stage_f, prior_med_f, gender, 
+    all_of(selected_genes_freq)
+  )
+
+clean_cox_freq <- coxph(
+  Surv(entry_time, exit_time, event) ~ .,
+  data = final_data_freq
+)
+
+summary(clean_cox_freq)
+```
+
+### cross validation
+
+```{r}
+### 4. Cross-Validation (C-Index)
+set.seed(629)
+K <- 5
+n <- nrow(final_data_freq)
+fold_id <- sample(rep(1:K, length.out = n))
+cv_cindex_freq <- numeric(K)
+
+for(k in 1:K){
+  train_data <- final_data_freq[fold_id != k, ]
+  test_data  <- final_data_freq[fold_id == k, ]
+  
+  fit <- coxph(Surv(entry_time, exit_time, event) ~ ., data = train_data)
+  
+  test_data$risk_score <- predict(fit, newdata = test_data, type = "lp", na.action = na.pass)
+  
+  c_obj <- concordance(
+    Surv(entry_time, exit_time, event) ~ risk_score,
+    data = test_data,
+    reverse = TRUE
+  )
+  
+  cv_cindex_freq[k] <- c_obj$concordance
+}
+
+cat("Frequency Pipeline Mean C-index:", mean(cv_cindex_freq, na.rm = TRUE), "\n")
+cat("Frequency Pipeline SD C-index:", sd(cv_cindex_freq, na.rm = TRUE), "\n")
+```
+
+### calibration visualization
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(survival)
+
+# 1. Define the time horizon (80th percentile of follow-up time)
+# Make sure to use the exit_time from your frequency dataset
+time_horizon_freq <- quantile(final_data_freq$exit_time, 0.80)
+
+# 2. Calculate predicted survival probabilities at the time horizon
+sf_final_freq <- survfit(clean_cox_freq, newdata = final_data_freq)
+pred_surv_freq <- summary(sf_final_freq, times = time_horizon_freq)$surv
+pred_surv_freq <- as.numeric(pred_surv_freq)
+
+# 3. Add predictions to the dataset and create risk deciles
+final_data_freq$pred_surv <- pred_surv_freq
+final_data_freq$decile <- ntile(final_data_freq$pred_surv, 10)
+
+# 4. Calculate observed Kaplan-Meier estimates for each decile
+calibration_data_freq <- final_data_freq %>%
+  group_by(decile) %>%
+  group_modify(~ {
+    
+    km_fit <- survfit(Surv(entry_time, exit_time, event) ~ 1, data = .x)
+    
+    # extend = TRUE ensures we get an estimate even if the curve drops off early
+    km_summary <- summary(km_fit, 
+                          times = time_horizon_freq, 
+                          extend = TRUE)
+    
+    data.frame(
+      mean_pred = mean(.x$pred_surv, na.rm = TRUE),
+      km_est = km_summary$surv
+    )
+  })
+
+# 5. Plot the calibration curve
+ggplot(calibration_data_freq, aes(x = mean_pred, y = km_est)) +
+  geom_point(size = 3, color = "darkblue") + # Changed color to easily distinguish from TF-IDF
+  geom_line(color = "darkblue", size = 1) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red", size = 1) +
+  scale_x_continuous(limits = c(0, 1), breaks = seq(0, 1, 0.2)) + 
+  scale_y_continuous(limits = c(0, 1), breaks = seq(0, 1, 0.2)) +
+  labs(
+    x = paste("Predicted Survival Probability at Time =", round(time_horizon_freq, 1)),
+    y = "Observed Survival Probability (Kaplan-Meier)",
+    title = "Calibration Plot: Frequency Filter (>3%) Model",
+    subtitle = "Red dashed line indicates perfect calibration"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+# Make sure the package is loaded
+library(timeROC)
+
+# 1. Generate the risk scores from your frequency-based model
+final_data_freq$risk_score <- predict(clean_cox_freq, type = "lp")
+
+# 2. Define the time horizon (ensuring it matches your calibration plot)
+time_horizon_freq <- quantile(final_data_freq$exit_time, 0.80)
+
+# 3. Calculate the Time-dependent ROC
+roc_freq <- timeROC(
+  T = final_data_freq$exit_time,
+  delta = final_data_freq$event,
+  marker = final_data_freq$risk_score, 
+  cause = 1,
+  times = time_horizon_freq,
+  iid = TRUE # Keeps the data needed to calculate Confidence Intervals
+)
+
+# 4. Extract the Area Under the Curve (AUC) and 95% Confidence Intervals
+auc_val_freq <- roc_freq$AUC[2] 
+se_val_freq <- roc_freq$inference$vect_sd_1[2]
+
+ci_lower_freq <- auc_val_freq - 1.96 * se_val_freq
+ci_upper_freq <- auc_val_freq + 1.96 * se_val_freq
+
+cat("Frequency Pipeline - Time Horizon:", round(time_horizon_freq, 2), "\n")
+cat("Frequency Pipeline - AUC:", round(auc_val_freq, 3), "\n")
+cat("95% CI: [", round(ci_lower_freq, 3), "-", round(ci_upper_freq, 3), "]\n\n")
+
+# 5. Plot the ROC Curve
+# Using 'dodgerblue' to match your Frequency calibration plot
+plot(roc_freq, 
+     time = time_horizon_freq, 
+     col = "darkblue", 
+     lwd = 2, 
+     title = FALSE)
+
+# Add reference line and title
+abline(0, 1, lty = 2, col = "gray50")
+title(main = paste("Frequency Filter (>3%) Model ROC\nat Time =", round(time_horizon_freq, 1)))
+
+# Add legend with the final AUC value
+legend("bottomright", 
+       legend = paste0("AUC = ", round(auc_val_freq, 2), 
+                       " (", round(ci_lower_freq, 2), "-", round(ci_upper_freq, 2), ")"),
+       col = "darkblue", 
+       lwd = 2, 
+       bty = "n")
+```
+
+## 2. 
+
+

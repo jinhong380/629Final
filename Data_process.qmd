@@ -93,9 +93,8 @@ nsclc_combined <- nsclc_combined %>%
     age_at_diagnosis = CURRENT_AGE_DEID - (abs(START_DATE) / 365.25),
 
     entry_time = ifelse(START_DATE < 0, abs(START_DATE), 0) / 30.44, 
-    exit_time = OS_MONTHS
+    exit_time = entry_time + OS_MONTHS
   ) %>%
-  # Filter: You must exist (sequencing) before you die (event)
   filter(exit_time > entry_time, !is.na(entry_time), !is.na(exit_time))
 
 # Check missingness after the cleaning
