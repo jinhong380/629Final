@@ -10,6 +10,10 @@ editor: visual
 library(dplyr)
 library(survminer)
 library(ggplot2)
+library(timeROC)
+library(LTRCforests)
+library(tidyr)
+library(LTRCtrees)
 library(survival)
 nsclc <- read.csv("nsclc.csv") # read in the dataset
 
@@ -206,7 +210,6 @@ ggplot(calibration_data_freq, aes(x = mean_pred, y = km_est)) +
 
 ```{r}
 # Make sure the package is loaded
-library(timeROC)
 
 # 1. Generate the risk scores from your frequency-based model
 final_data_freq$risk_score <- predict(clean_cox_freq, type = "lp")
@@ -256,6 +259,168 @@ legend("bottomright",
        bty = "n")
 ```
 
-## 2. 
+## 2. RSF
+
+### Fit MOdel
+
+```{r}
+# Define the features to include in the model
+clinical_features <- c("age_at_diagnosis", "smoke_f", "stage_f", "prior_med_f", "gender")
+all_features <- c(clinical_features, genes_to_keep)
+
+# Construct the formula
+rf_formula <- as.formula(
+  paste("Surv(entry_time, exit_time, event) ~", paste(all_features, collapse = " + "))
+)
+
+# Define mtry
+m_try <- max(floor(sqrt(length(all_features))), 1)
+
+# Fit the Random Forest Model
+set.seed(629)
+rf_model <- ltrcrrf(
+  formula = rf_formula,
+  data = nsclc_filtered_complete,
+  ntree = 500,        # Standard for publication-quality results
+  nodesize = 20,      # Keeps trees from getting too deep
+  mtry = m_try,       # Variable subset size at each split
+  nsplit = 10         # Random splits to optimize speed
+)
+
+# print(rf_model)
+```
+### Cross-validation (c-index)
+
+```{r}
+# Define the time horizon (80th percentile of follow-up time)
+time_horizon_rf <- quantile(nsclc_filtered_complete$exit_time, 0.80)
+
+set.seed(629)
+K <- 5
+n <- nrow(nsclc_filtered_complete)
+fold_id <- sample(rep(1:K, length.out = n))
+cv_cindex_rf <- numeric(K)
+
+for(k in 1:K){
+  train_data <- nsclc_filtered_complete[fold_id != k, ]
+  test_data  <- nsclc_filtered_complete[fold_id == k, ]
+  
+  # Fit the model on the training fold
+  fit <- ltrcrrf(
+    formula = rf_formula, 
+    data = train_data, 
+    ntree = 500, nodesize = 20, mtry = m_try, nsplit = 10
+  )
+  
+  # Use predictProb for LTRCtrees objects
+  prob_obj <- predictProb(
+    fit,
+    newdata = test_data,
+    time.eval = time_horizon_rf
+  )
+  
+  # Extract survival probabilities
+  survival_score <- as.numeric(prob_obj$survival.probs)
+  
+  # Convert survival to risk (higher score = higher risk of event)
+  test_data$risk_score <- 1 - survival_score
+  
+  # Calculate Concordance
+  c_obj <- concordance(
+    Surv(entry_time, exit_time, event) ~ risk_score,
+    data = test_data,
+    reverse = TRUE # TRUE because higher risk_score should correspond to shorter survival
+  )
+  
+  cv_cindex_rf[k] <- c_obj$concordance
+}
+
+cat("RF Pipeline Mean C-index:", mean(cv_cindex_rf, na.rm = TRUE), "\n")
+cat("RF Pipeline SD C-index:", sd(cv_cindex_rf, na.rm = TRUE), "\n")
+```
+
+### Calibration 
+
+```{r}
+# --- GET FULL DATASET PREDICTIONS ---
+full_prob_obj <- predictProb(
+  rf_model,
+  newdata = nsclc_filtered_complete,
+  time.eval = time_horizon_rf
+)
+
+# Extract survival and calculate risk
+nsclc_filtered_complete$pred_surv <- as.numeric(full_prob_obj$survival.probs)
+nsclc_filtered_complete$risk_score <- 1 - nsclc_filtered_complete$pred_surv
+
+
+# --- CALIBRATION PLOT ---
+# Create risk deciles based on predicted survival
+nsclc_filtered_complete$decile <- ntile(nsclc_filtered_complete$pred_surv, 10)
+
+calibration_data_rf <- nsclc_filtered_complete %>%
+  group_by(decile) %>%
+  group_modify(~ {
+    km_fit <- survfit(Surv(entry_time, exit_time, event) ~ 1, data = .x)
+    km_summary <- summary(km_fit, times = time_horizon_rf, extend = TRUE)
+    
+    data.frame(
+      mean_pred = mean(.x$pred_surv, na.rm = TRUE),
+      km_est = km_summary$surv
+    )
+  })
+
+ggplot(calibration_data_rf, aes(x = mean_pred, y = km_est)) +
+  geom_point(size = 3, color = "navy") +
+  geom_line(color = "navy", size = 1) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red", size = 1) +
+  scale_x_continuous(limits = c(0, 1), breaks = seq(0, 1, 0.2)) + 
+  scale_y_continuous(limits = c(0, 1), breaks = seq(0, 1, 0.2)) +
+  labs(
+    x = paste("Predicted Survival Probability at Time =", round(time_horizon_rf, 1)),
+    y = "Observed Survival Probability (Kaplan-Meier)",
+    title = "Calibration Plot: Random Forest Survival Model",
+  ) +
+  theme_minimal()
+
+```
+
+### Time-Dependent ROC
+
+```{r}
+# --- TIME-DEPENDENT ROC ---
+roc_rf <- timeROC(
+  T = nsclc_filtered_complete$exit_time,
+  delta = nsclc_filtered_complete$event,
+  marker = nsclc_filtered_complete$risk_score, # Using the properly calculated risk score
+  cause = 1,
+  times = time_horizon_rf,
+  iid = TRUE 
+)
+
+auc_val_rf <- roc_rf$AUC[2] 
+se_val_rf <- roc_rf$inference$vect_sd_1[2]
+ci_lower_rf <- auc_val_rf - 1.96 * se_val_rf
+ci_upper_rf <- auc_val_rf + 1.96 * se_val_rf
+
+cat("RF Pipeline - Time Horizon:", round(time_horizon_rf, 2), "\n")
+cat("RF Pipeline - AUC:", round(auc_val_rf, 3), "\n")
+cat("95% CI: [", round(ci_lower_rf, 3), "-", round(ci_upper_rf, 3), "]\n\n")
+
+plot(roc_rf, 
+     time = time_horizon_rf, 
+     col = "navy", 
+     lwd = 2, 
+     title = FALSE)
+
+abline(0, 1, lty = 2, col = "gray50")
+title(main = paste("Random Forest Survival Model ROC\nat Time =", round(time_horizon_rf, 1)))
+legend("bottomright", 
+       legend = paste0("AUC = ", round(auc_val_rf, 2), 
+                       " (", round(ci_lower_rf, 2), "-", round(ci_upper_rf, 2), ")"),
+       col = "navy", 
+       lwd = 2, 
+       bty = "n")
+```
 
 

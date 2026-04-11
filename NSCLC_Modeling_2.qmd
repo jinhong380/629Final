@@ -9,6 +9,7 @@ editor: visual
 ```{r}
 library(dplyr)
 library(survminer)
+library(LTRCforests)
 library(ggplot2)
 library(survival)
 nsclc <- read.csv("nsclc.csv") # read in the dataset
@@ -342,4 +343,237 @@ legend("bottomright",
        lwd = 2, 
        bty = "n")}
 ```
+
+## 2. rsf
+
+### prepare the data by excluding the gene with frequency <= 1% (to reduce overfitting and increase interpretability)
+
+```{r}
+library(dplyr)
+library(LTRCtrees) # For the random forest model
+library(tidyr)
+
+# 1. Define clinical columns to isolate the gene matrix
+clinical_cols <- c(
+  "X", "PATIENT_ID", "age_at_diagnosis",  "event", 
+  "entry_time", "exit_time", "smoke_f", "stage_f", "prior_med_to_msk_f", 
+  "prior_med_f", "gender"
+)
+
+# Isolate the true gene columns
+gene_cols <- setdiff(colnames(nsclc), clinical_cols)
+gene_matrix <- nsclc %>%
+  select(all_of(gene_cols)) %>%
+  mutate(across(everything(), ~ as.numeric(as.character(.)))) 
+
+# 2. Filter out genes with less than 1% frequency
+N <- nrow(gene_matrix)
+gene_frequencies <- colMeans(gene_matrix, na.rm = TRUE)
+genes_to_keep_tfidf <- names(gene_frequencies[gene_frequencies >= 0.01])
+
+# Subset matrix to kept genes
+gene_matrix_filtered <- gene_matrix[, genes_to_keep_tfidf]
+
+# 3. Calculate N and df for the filtered genes
+df_filtered <- colSums(gene_matrix_filtered, na.rm = TRUE) 
+
+# 4. Calculate the IDF Weights
+idf_weights <- log(N / df_filtered)
+
+# 5. Apply weights (TF * IDF)
+gene_matrix_weighted <- sweep(
+  x = gene_matrix_filtered, 
+  MARGIN = 2, 
+  STATS = idf_weights, 
+  FUN = "*"
+)
+
+# 6. Recombine with clinical data and drop NAs for perfectly aligned complete cases
+nsclc_tfidf_complete <- bind_cols(nsclc[, clinical_cols], gene_matrix_weighted) %>% 
+  drop_na()
+
+# Check your results
+cat("Total patients (N complete):", nrow(nsclc_tfidf_complete), "\n")
+cat("Original genes evaluated:", length(gene_cols), "\n")
+cat("Genes kept for TF-IDF (>= 1% frequency):", length(genes_to_keep_tfidf), "\n")
+```
+
+### fit the rsf
+
+```{r}
+# 1. Define the features to include in the model
+clinical_features <- c("age_at_diagnosis", "smoke_f", "stage_f", "prior_med_f", "gender")
+all_features <- c(clinical_features, genes_to_keep_tfidf)
+
+# 2. Dynamically construct the formula
+rf_formula <- as.formula(
+  paste("Surv(entry_time, exit_time, event) ~", paste(all_features, collapse = " + "))
+)
+
+# 3. Define mtry (rule of thumb is square root of the number of predictors)
+m_try <- max(floor(sqrt(length(all_features))), 1)
+
+# 4. Fit the Random Forest Model
+set.seed(629)
+rf_model_tfidf <- ltrcrrf(
+  formula = rf_formula,
+  data = nsclc_tfidf_complete,
+  ntree = 500,        
+  nodesize = 20,      
+  mtry = m_try,       
+  nsplit = 10         
+)
+
+# print(rf_model_tfidf)
+```
+
+### cross-validatoin (c-index)
+
+```{r}
+library(survival)
+
+# Define the time horizon (80th percentile of follow-up time) for risk extraction
+time_horizon_tfidf <- quantile(nsclc_tfidf_complete$exit_time, 0.80)
+
+set.seed(629)
+K <- 5
+n <- nrow(nsclc_tfidf_complete)
+fold_id <- sample(rep(1:K, length.out = n))
+cv_cindex_rf_tfidf <- numeric(K)
+
+for(k in 1:K){
+  train_data <- nsclc_tfidf_complete[fold_id != k, ]
+  test_data  <- nsclc_tfidf_complete[fold_id == k, ]
+  
+  # Fit the model on the training fold
+  fit <- ltrcrrf(
+    formula = rf_formula, 
+    data = train_data, 
+    ntree = 500, nodesize = 20, mtry = m_try, nsplit = 10
+  )
+  
+  # Use predictProb to get survival at the exact time horizon
+  prob_obj <- predictProb(
+    fit,
+    newdata = test_data,
+    time.eval = time_horizon_tfidf
+  )
+  
+  # Convert survival to risk score (1 - survival)
+  survival_score <- as.numeric(prob_obj$survival.probs)
+  test_data$risk_score <- 1 - survival_score
+  
+  # Calculate Concordance
+  c_obj <- concordance(
+    Surv(entry_time, exit_time, event) ~ risk_score,
+    data = test_data,
+    reverse = TRUE # TRUE because higher risk_score corresponds to shorter survival
+  )
+  
+  cv_cindex_rf_tfidf[k] <- c_obj$concordance
+}
+
+cat("TF-IDF RF Mean C-index:", mean(cv_cindex_rf_tfidf, na.rm = TRUE), "\n")
+cat("TF-IDF RF SD C-index:", sd(cv_cindex_rf_tfidf, na.rm = TRUE), "\n")
+```
+
+### calibration plot
+
+```{r}
+library(ggplot2)
+
+# Get predictions on the full dataset at the time horizon
+full_prob_obj <- predictProb(
+  rf_model_tfidf,
+  newdata = nsclc_tfidf_complete,
+  time.eval = time_horizon_tfidf
+)
+
+# Extract predicted survival probability 
+nsclc_tfidf_complete$pred_surv <- as.numeric(full_prob_obj$survival.probs)
+
+# Create risk deciles based on predicted survival
+nsclc_tfidf_complete$decile <- ntile(nsclc_tfidf_complete$pred_surv, 10)
+
+# Calculate observed Kaplan-Meier estimates for each decile
+calibration_data_rf_tfidf <- nsclc_tfidf_complete %>%
+  group_by(decile) %>%
+  group_modify(~ {
+    
+    km_fit <- survfit(Surv(entry_time, exit_time, event) ~ 1, data = .x)
+    km_summary <- summary(km_fit, 
+                          times = time_horizon_tfidf, 
+                          extend = TRUE)
+    
+    data.frame(
+      mean_pred = mean(.x$pred_surv, na.rm = TRUE),
+      km_est = km_summary$surv
+    )
+  })
+
+# Plot the calibration curve (using purple to distinctively mark the TF-IDF RF model)
+ggplot(calibration_data_rf_tfidf, aes(x = mean_pred, y = km_est)) +
+  geom_point(size = 3, color = "navy") + 
+  geom_line(color = "navy", size = 1) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red", size = 1) +
+  scale_x_continuous(limits = c(0, 1), breaks = seq(0, 1, 0.2)) + 
+  scale_y_continuous(limits = c(0, 1), breaks = seq(0, 1, 0.2)) +
+  labs(
+    x = paste("Predicted Survival Probability at Time =", round(time_horizon_tfidf, 1)),
+    y = "Observed Survival Probability (Kaplan-Meier)",
+    title = "Calibration Plot: TF-IDF Weighted Random Forest",
+    subtitle = "Red dashed line indicates perfect calibration"
+  ) +
+  theme_minimal()
+```
+
+### time-dependent ROC
+
+```{r}
+library(timeROC)
+
+# Generate the risk scores from the calculated survival probabilities
+nsclc_tfidf_complete$risk_score <- 1 - nsclc_tfidf_complete$pred_surv
+
+# Calculate the Time-dependent ROC
+roc_rf_tfidf <- timeROC(
+  T = nsclc_tfidf_complete$exit_time,
+  delta = nsclc_tfidf_complete$event,
+  marker = nsclc_tfidf_complete$risk_score, 
+  cause = 1,
+  times = time_horizon_tfidf,
+  iid = TRUE 
+)
+
+# Extract the Area Under the Curve (AUC) and 95% Confidence Intervals
+auc_val_rf_tfidf <- roc_rf_tfidf$AUC[2] 
+se_val_rf_tfidf <- roc_rf_tfidf$inference$vect_sd_1[2]
+
+ci_lower_rf_tfidf <- auc_val_rf_tfidf - 1.96 * se_val_rf_tfidf
+ci_upper_rf_tfidf <- auc_val_rf_tfidf + 1.96 * se_val_rf_tfidf
+
+cat("TF-IDF RF - Time Horizon:", round(time_horizon_tfidf, 2), "\n")
+cat("TF-IDF RF - AUC:", round(auc_val_rf_tfidf, 3), "\n")
+cat("95% CI: [", round(ci_lower_rf_tfidf, 3), "-", round(ci_upper_rf_tfidf, 3), "]\n\n")
+
+# Plot the ROC Curve
+plot(roc_rf_tfidf, 
+     time = time_horizon_tfidf, 
+     col = "navy", 
+     lwd = 2, 
+     title = FALSE)
+
+# Add reference line and title
+abline(0, 1, lty = 2, col = "gray50")
+title(main = paste("TF-IDF Random Forest ROC\nat Time =", round(time_horizon_tfidf, 1)))
+
+# Add legend with the final AUC value
+legend("bottomright", 
+       legend = paste0("AUC = ", round(auc_val_rf_tfidf, 2), 
+                       " (", round(ci_lower_rf_tfidf, 2), "-", round(ci_upper_rf_tfidf, 2), ")"),
+       col = "navy", 
+       lwd = 2, 
+       bty = "n")
+```
+
 

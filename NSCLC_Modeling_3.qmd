@@ -39,6 +39,12 @@ clinical_cols <- c(
   "prior_med_f", "gender"
 
 )
+
+# Identify genes by subtracting clinical columns from all column names
+gene_cols <- setdiff(names(nsclc), clinical_cols)
+
+# Create the matrix used in the loop
+gene_matrix <- nsclc[, gene_cols]
 ```
 
 ## Data Processing
@@ -102,7 +108,7 @@ cat("Total KEGG Pathways evaluated:", length(kegg_list), "\n")
 cat("Pathways with at least 1 mutation in cohort:", length(active_pathways), "\n")
 ```
 
-2. Prepare data for glmnet
+2.  Prepare data for glmnet
 
 ```{r}
 library(tidyr)
@@ -195,6 +201,7 @@ clean_cox_model_path <- coxph(
 # Check the output (and check if the warning is gone!)
 summary(clean_cox_model_path)
 ```
+
 ### C-index
 
 ```{r}
@@ -356,12 +363,11 @@ library(LTRCforests)
 library(dplyr)
 library(survival)
 
-# 1. Clean the dataset to ensure the forest only sees true predictors
-# We drop the prediction columns generated during the Cox evaluation
+# Clean the dataset to ensure the forest only sees true predictors, drop the prediction columns generated during the Cox evaluation
 rsf_data <- final_model_data_path %>%
   select(-any_of(c("risk_score", "pred_surv", "decile")))
 
-# 2. Define the time horizon (same as before)
+# Define the time horizon (same as before)
 time_horizon_path <- quantile(rsf_data$exit_time, 0.80)
 ```
 
@@ -394,7 +400,7 @@ for(k in 1:K){
     data = train_data_rsf,
     ntree = 500,        
   nodesize = 20,      
-  mtry = 3,           # Rule of thumb: sqrt(number of predictors)
+  mtry = 3,           
   nsplit = 10         # Randomly chooses 10 split points per variable to save time
   )
   
@@ -422,6 +428,7 @@ for(k in 1:K){
 cat("LTRC Forest Mean CV C-index:", mean(cv_cindex_rsf, na.rm = TRUE), "\n")
 cat("LTRC Forest SD CV C-index:", sd(cv_cindex_rsf, na.rm = TRUE), "\n")
 ```
+
 #### time-dependent ROC:
 
 ```{r}
@@ -486,7 +493,6 @@ legend("bottomright",
        bty = "n")}
 ```
 
-
 #### calibration plot:
 
 ```{r}
@@ -548,8 +554,4 @@ ggplot(calibration_data_rsf, aes(x = mean_pred, y = km_est)) +
   ) +
   theme_minimal()
 ```
-
-
-
-
 
