@@ -12,6 +12,7 @@ editor: visual
 library(dplyr)
 library(glmnet)
 library(survminer)
+library(LTRCforests)
 library(ggplot2)
 library(survival)
 nsclc <- read.csv("nsclc.csv") # read in the dataset
@@ -353,182 +354,126 @@ ggplot(calibration_data_path, aes(x = mean_pred, y = km_est)) +
   theme_minimal()
 ```
 
-### 2. Left-truncated random forest
+## 2. Left-truncated random forest
 
-#### 1. Setup and Data Cleaning
+### Data Cleaning and Train/Test Split (80/20)
 
 ```{r}
-# install.packages("LTRCforests")
-library(LTRCforests)
-library(dplyr)
-library(survival)
-
-# Clean the dataset to ensure the forest only sees true predictors, drop the prediction columns generated during the Cox evaluation
+# Clean the dataset to ensure the forest only sees true predictors
 rsf_data <- final_model_data_path %>%
-  select(-any_of(c("risk_score", "pred_surv", "decile")))
+  select(-any_of(c("risk_score", "pred_surv", "decile"))) %>%
+  as.data.frame()
 
-# Define the time horizon (same as before)
-time_horizon_path <- quantile(rsf_data$exit_time, 0.80)
+set.seed(629)
+N_total <- nrow(rsf_data)
+train_idx <- sample(1:N_total, size = floor(0.8 * N_total))
+
+train_data_rsf <- rsf_data[train_idx, ]
+test_data_rsf  <- rsf_data[-train_idx, ]
+
+cat("Train patients:", nrow(train_data_rsf), "\n")
+cat("Test patients:", nrow(test_data_rsf), "\n")
 ```
 
-#### 2. Cross-Validated C-Index (LTRC Forest)
+### Fit the LTRC Forest on TRAIN Data
 
 ```{r}
-set.seed(629)
-
-rsf_data <- as.data.frame(rsf_data)
 predictor_names <- setdiff(colnames(rsf_data), c("entry_time", "exit_time", "event"))
 
-# This stitches them together into: Surv(entry_time, exit_time, event) ~ age + gender + KEGG_...
-rsf_formula <- as.formula(paste("Surv(entry_time, exit_time, event) ~", 
-                                paste(predictor_names, collapse = " + ")))
-
-
-K <- 5
-n_rsf <- nrow(rsf_data)
-fold_id_rsf <- sample(rep(1:K, length.out = n_rsf))
-cv_cindex_rsf <- numeric(K)
-
-for(k in 1:K){
-  
-  train_data_rsf <- rsf_data[fold_id_rsf != k, ]
-  test_data_rsf  <- rsf_data[fold_id_rsf == k, ]
-  
-  # Fit the forest using our explicit formula
-  fit_rsf <- ltrcrrf(
-    formula = rsf_formula, # Using the exact formula we built above
-    data = train_data_rsf,
-    ntree = 500,        
-  nodesize = 20,      
-  mtry = 3,           
-  nsplit = 10         # Randomly chooses 10 split points per variable to save time
-  )
-  
-  # Predict survival probabilities at the specific time horizon
-  pred_obj <- predictProb(
-    fit_rsf, 
-    newdata = test_data_rsf, 
-    time.eval = time_horizon_path
-  )
-  
-  # Extract the survival probabilities 
-  test_data_rsf$rsf_risk <- 1-as.numeric(pred_obj$survival.probs)
-  
-  # Compute C-index on the test fold
-  c_obj_rsf <- concordance(
-    Surv(entry_time, exit_time, event) ~ rsf_risk,
-    data = test_data_rsf,
-    reverse = TRUE
-  )
-  
-  cv_cindex_rsf[k] <- c_obj_rsf$concordance
-}
-
-# Print results
-cat("LTRC Forest Mean CV C-index:", mean(cv_cindex_rsf, na.rm = TRUE), "\n")
-cat("LTRC Forest SD CV C-index:", sd(cv_cindex_rsf, na.rm = TRUE), "\n")
-```
-
-#### time-dependent ROC:
-
-```{r}
-library(timeROC)
-
-# 1. Fit the final LTRC Forest on the whole cohort
-final_rsf_model <- ltrcrrf(
-  formula = rsf_formula, # Use the explicit formula here too!
-  data = rsf_data,
-  ntree = 500 ,        
-  nodesize = 20,      
-  mtry = 3,           # Rule of thumb: sqrt(number of predictors)
-  nsplit = 10         # Randomly chooses 10 split points per variable to save time
+# Build the formula dynamically
+rsf_formula <- as.formula(
+  paste("Surv(entry_time, exit_time, event) ~", paste(predictor_names, collapse = " + "))
 )
 
+# Fit the forest using ONLY the training data
+set.seed(629)
+final_rsf_model <- ltrcrrf(
+  formula = rsf_formula,
+  data = train_data_rsf,
+  ntree = 500,        
+  nodesize = 20,      
+  mtry = 3,           
+  nsplit = 10         
+)
+```
 
-# 2. Generate survival probabilities for the whole cohort
-final_pred_obj <- predictProb(
+### Evaluation on Independent TEST Data
+
+#### c-index
+
+```{r}
+# Define the time horizon based on the training set follow-up
+time_horizon_path <- quantile(train_data_rsf$exit_time, 0.80)
+
+# Predict survival probabilities on the TEST set
+test_pred_obj <- predictProb(
   final_rsf_model, 
-  newdata = rsf_data, 
+  newdata = test_data_rsf, 
   time.eval = time_horizon_path
 )
 
-# 3. Add the risk score to our dataset
-rsf_data$rsf_risk <- 1 - as.numeric(final_pred_obj$survival.probs)
-rsf_data$pred_surv <- as.numeric(final_pred_obj$survival.probs)
+# Add predictions and risk scores to the test dataset
+test_data_rsf$pred_surv <- as.numeric(test_pred_obj$survival.probs)
+test_data_rsf$rsf_risk <- 1 - test_data_rsf$pred_surv
 
-# 4. Calculate the Time-dependent ROC
+c_obj_rsf <- concordance(
+  Surv(entry_time, exit_time, event) ~ rsf_risk,
+  data = test_data_rsf,
+  reverse = TRUE
+)
+
+cat("\nOut-of-Sample C-index:", round(c_obj_rsf$concordance, 3), "\n")
+```
+
+
+#### Time-Dependent ROC on TEST
+
+```{r}
 roc_rsf <- timeROC(
-  T = rsf_data$exit_time,
-  delta = rsf_data$event,
-  marker = rsf_data$rsf_risk, 
+  T = test_data_rsf$exit_time,
+  delta = test_data_rsf$event,
+  marker = test_data_rsf$rsf_risk, 
   cause = 1,
   times = time_horizon_path,
   iid = TRUE
 )
 
-# 5. Extract AUC and CI
 auc_value_rsf <- roc_rsf$AUC[2] 
 se_value_rsf <- roc_rsf$inference$vect_sd_1[2]
 ci_lower_rsf <- auc_value_rsf - 1.96 * se_value_rsf
 ci_upper_rsf <- auc_value_rsf + 1.96 * se_value_rsf
 
-cat("LTRC Forest AUC at Time Horizon:", round(auc_value_rsf, 3), "\n")
+cat("Out-of-Sample AUC at Time Horizon (", round(time_horizon_path, 1), "):", round(auc_value_rsf, 3), "\n")
 cat("95% CI: [", round(ci_lower_rsf, 3), "-", round(ci_upper_rsf, 3), "]\n\n")
 
-# 6. Plot the ROC Curve
-{plot(roc_rsf, 
+plot(roc_rsf, 
      time = time_horizon_path, 
-     col = "darkorange", # Unique color for the Random Forest
+     col = "navy", 
      lwd = 2, 
      title = FALSE)
 
-abline(0, 1, lty = 2, col = "gray50")
-title(main = paste("LTRC Random Forest ROC\nat Time =", round(time_horizon_path, 1)))
+abline(0, 1, lty = 2, col = "gray")
+title(main = paste("Out-of-Sample LTRC Forest ROC\nat Time =", round(time_horizon_path, 1)))
 
 legend("bottomright", 
        legend = paste0("AUC = ", round(auc_value_rsf, 2), 
                        " (", round(ci_lower_rsf, 2), "-", round(ci_upper_rsf, 2), ")"),
-       col = "darkorange", 
+       col = "navy", 
        lwd = 2, 
-       bty = "n")}
+       bty = "n")
 ```
 
-#### calibration plot:
+#### Calibration Plot on TEST
 
 ```{r}
-library(ggplot2)
-library(dplyr)
-library(survival)
+# Using 5 groups (quintiles) instead of 10 deciles because the test set is 20% of the total size.
+test_data_rsf$decile <- ntile(test_data_rsf$pred_surv, 5)
 
-# 1. Define the time horizon (80th percentile of follow-up time, same as ROC)
-time_horizon_path <- quantile(rsf_data$exit_time, 0.80)
-
-# 2. Calculate predicted survival probabilities for the entire cohort at the time horizon
-# Using predictProb for the LTRC Forest instead of survfit
-final_pred_obj <- predictProb(
-  final_rsf_model, 
-  newdata = rsf_data, 
-  time.eval = time_horizon_path
-)
-# Safely extract as numeric to avoid the dimension error
-pred_surv_rsf <- as.numeric(final_pred_obj$survival.probs)
-
-# 3. Add predictions to the dataset
-rsf_data$pred_surv <- pred_surv_rsf
-
-# 4. Create 10 risk groups (deciles) based on predicted survival
-# Note: If your dataset is small, you might want to use 5 groups (ntile(..., 5)) instead
-rsf_data$decile <- ntile(rsf_data$pred_surv, 10)
-
-# 5. Calculate observed Kaplan-Meier estimates for each decile
-calibration_data_rsf <- rsf_data %>%
+calibration_data_rsf <- test_data_rsf %>%
   group_by(decile) %>%
   group_modify(~ {
     
     km_fit <- survfit(Surv(entry_time, exit_time, event) ~ 1, data = .x)
-    
-    # extend = TRUE ensures we get an estimate even if the last event in a decile 
-    # happened slightly before the time horizon
     km_summary <- summary(km_fit, 
                           times = time_horizon_path, 
                           extend = TRUE)
@@ -539,7 +484,6 @@ calibration_data_rsf <- rsf_data %>%
     )
   })
 
-# 6. Plot the calibration curve
 ggplot(calibration_data_rsf, aes(x = mean_pred, y = km_est)) +
   geom_point(size = 3, color = "navy") +
   geom_line(color = "navy") +
@@ -549,9 +493,7 @@ ggplot(calibration_data_rsf, aes(x = mean_pred, y = km_est)) +
   labs(
     x = "Predicted Survival Probability",
     y = "Observed Survival Probability (Kaplan-Meier)",
-    title = "Calibration Plot: LTRC Relative Risk Forest",
-    subtitle = paste("Evaluated at Time =", round(time_horizon_path, 1), "| Red dashed line = perfect calibration")
+    title = "Out-of-Sample Calibration: LTRC Forest"
   ) +
   theme_minimal()
 ```
-

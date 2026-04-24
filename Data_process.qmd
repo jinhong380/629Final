@@ -1,6 +1,6 @@
 ---
 title: "Untitled"
-format: html
+format: pdf
 editor: visual
 ---
 
@@ -12,18 +12,21 @@ library(tidyr)
 library(data.table)
 library(ggplot2)
 library(dplyr)
-# find the dataset
-datadir <- "msk_chord_2024/"
+library(data.table)
 
-# Load the datasets:
-clin_patient <- fread(paste0(datadir, "data_clinical_patient.txt"), skip = 4) 
+# Define the base URL for the MSK-CHORD GitHub repository
+base_url <- "https://media.githubusercontent.com/media/cBioPortal/datahub/refs/heads/master/public/msk_chord_2024/"
+
+# Load the datasets directly from GitHub:
+clin_patient <- fread(paste0(base_url, "data_clinical_patient.txt"), skip = 4) 
 # PATIENT_ID, CANCER_TYPE
-clin_sample  <- fread(paste0(datadir, "data_clinical_sample.txt"), skip = 4)
-#OS_MONTHS, OS_STATUS, CURRENT_AGE_DEID, GENDER, STAGE_HIGHEST_RECORDED, SMOKING_PREDICTIONS_3_CLASSES
 
-muta <- fread(paste0(datadir, "data_mutations.txt"))
+clin_sample  <- fread(paste0(base_url, "data_clinical_sample.txt"), skip = 4)
+# OS_MONTHS, OS_STATUS, CURRENT_AGE_DEID, GENDER, STAGE_HIGHEST_RECORDED, SMOKING_PREDICTIONS_3_CLASSES
+
+muta <- fread(paste0(base_url, "data_mutations.txt"))
 # TP53, KRAS, EGFR (canonical genes)
-# ALK, BRAF, STK11, KEAP1, PIK3CA,MET, ERBB2, ROS1 (driver panel)
+# ALK, BRAF, STK11, KEAP1, PIK3CA, MET, ERBB2, ROS1 (driver panel)
 
 muta_with_patient <- merge(
     muta,
@@ -33,10 +36,10 @@ muta_with_patient <- merge(
     all.x = TRUE
   )
 
-treat <- fread(paste0(datadir, "data_timeline_treatment.txt"))
+treat <- fread(paste0(base_url, "data_timeline_treatment.txt"))
 
-cancer_pred <- fread(paste0(datadir, "data_timeline_cancer_presence.txt"))
-cancer_diag <- fread(paste0(datadir, "data_timeline_diagnosis.txt"))
+cancer_pred <- fread(paste0(base_url, "data_timeline_cancer_presence.txt"))
+cancer_diag <- fread(paste0(base_url, "data_timeline_diagnosis.txt"))
 ```
 
 ## NSCLC
@@ -210,12 +213,8 @@ dashboard <- (p3 | p2) / (p1 | p4)
 dashboard + plot_annotation(title = "NSCLC Cohort Overview (N = 7802)")
 ```
 
-
 ```{r}
+# Write data to folder
 #library(readr)
 #write.csv(nsclc_final_nsclc, "nsclc.csv")
 ```
-
-
-
-
