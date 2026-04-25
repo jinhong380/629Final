@@ -5,6 +5,9 @@ This repository contains the code, data processing pipelines, and modeling resul
 
 We compare traditional linear models (Lasso-Cox) with non-linear machine learning approach (Random Survival Forests) across three feature engineering strategies to handle rare mutations.
 
+## Project Website
+**To view the project website, directly open the `website/docs/index.html` file in a web browser.**
+
 ## Repository Structure
 
 ### Data & Processing
