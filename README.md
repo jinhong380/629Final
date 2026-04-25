@@ -16,7 +16,8 @@ We compare traditional linear models (Lasso-Cox) with non-linear machine learnin
 ### Modeling
 The modeling phase is split into three separate Quarto documents, each testing a different feature engineering approach to evaluate how well rare mutations can be utilized:
 
-* **`NSCLC_Modeling_1.qmd`** & **`.pdf`**: **Feature Filtering** * *Baseline approach filtering for frequently mutated genes (e.g., >3% frequency).*
+* **`NSCLC_Modeling_1.qmd`** & **`.pdf`**: **Feature Filtering**
+    * *Baseline approach filtering for frequently mutated genes (e.g., >3% frequency).*
 * **`NSCLC_Modeling_2.qmd`** & **`.pdf`**: **Rarity Weighting**
     * *Applies weights to rare mutations to retain up to 509 genes without compromising model stability.*
 * **`NSCLC_Modeling_3.qmd`** & **`.pdf`**: **Biological Pathway Aggregation**
