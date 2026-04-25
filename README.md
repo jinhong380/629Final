@@ -1,9 +1,9 @@
 # MSK-CHORD NSCLC Survival Analysis
 
 ## Overview
-This repository contains the code, data processing pipelines, and modeling results for our final project (HDS 629). The project investigates the predictive value of rare gene mutations on long-term survival in Non-Small Cell Lung Cancer (NSCLC) patients using the MSK-CHORD dataset. 
+This repository contains the code, data processing pipelines, and modeling results for our final project. The project investigates the predictive value of rare gene mutations on long-term survival in Non-Small Cell Lung Cancer (NSCLC) patients using the MSK-CHORD dataset. 
 
-We compare traditional linear models (Lasso-Cox) with non-linear machine learning approaches (Random Survival Forests) across three distinct feature engineering strategies to handle rare mutations.
+We compare traditional linear models (Lasso-Cox) with non-linear machine learning approach (Random Survival Forests) across three feature engineering strategies to handle rare mutations.
 
 ## Repository Structure
 
@@ -11,7 +11,6 @@ We compare traditional linear models (Lasso-Cox) with non-linear machine learnin
 * **`msk_chord_2024/`**: Directory containing the initial raw data from the MSK-CHORD cohort.
 * **`Data_process.qmd`** & **`Data_process.pdf`**: The Quarto script (and compiled PDF report) used to clean and preprocess the raw clinical and genomic data.
 * **`nsclc.csv`**: The finalized, clean dataset used for model building.
-* **`Data_process_files/`**: Supporting files and figures generated during the data processing phase.
 
 ### Modeling
 The modeling phase is split into three separate Quarto documents, each testing a different feature engineering approach to evaluate how well rare mutations can be utilized:
@@ -25,7 +24,6 @@ The modeling phase is split into three separate Quarto documents, each testing a
 
 ### Project Files
 * **`Final_629code.Rproj`**: The RStudio Project file. Open this file in RStudio to set the working directory automatically and run the `.qmd` scripts.
-* **`.gitignore`**: Specifies intentionally untracked files to ignore (e.g., system files like `.DS_Store`).
 
 ## How to Run the Code
 1. Clone this repository to your local machine.
