@@ -8,13 +8,15 @@ editor: visual
 
 ```{r}
 library(dplyr)
+library(timeROC)
 library(survminer)
+library(tidyr)
+library(glmnet)
 library(LTRCforests)
 library(ggplot2)
 library(survival)
 nsclc <- read.csv("nsclc.csv") # read in the dataset
 
-# Adjusting factor variables
 # Adjusting factor variables
 nsclc <- nsclc %>% mutate(
   stage_f = as.factor(stage_f),
@@ -30,7 +32,7 @@ nsclc <- nsclc %>% mutate(
 ## 1. Cox - Rarity weight
 
 ```{r}
-# 1. Define clinical columns to isolate the gene matrix
+# Define clinical columns to isolate the gene matrix
 clinical_cols <- c(
   "X", "PATIENT_ID", "age_at_diagnosis",  "event", 
   "entry_time", "exit_time", "smoke_f", "stage_f", "prior_med_to_msk_f", 
@@ -43,14 +45,11 @@ gene_matrix <- nsclc %>%
   select(all_of(gene_cols)) %>%
   mutate(across(everything(), ~ as.numeric(as.character(.)))) 
 
-# 2. Calculate N and df 
+# Calculate N and df 
 N <- nrow(gene_matrix)
 df <- colSums(gene_matrix, na.rm = TRUE) 
 
-# 3. Handle zero-variance genes
-# If a gene has 0 mutations, log(N/0) equals Infinity. We must drop them.
-# It is also highly recommended to drop "singletons" (genes mutated in only 1 or 2 patients) 
-# to prevent the Cox model from overfitting to a single patient's outcome.
+# Handle zero-variance genes
 min_mutations <- 3 
 genes_to_keep_tfidf <- names(df[df >= min_mutations])
 
@@ -58,11 +57,10 @@ genes_to_keep_tfidf <- names(df[df >= min_mutations])
 gene_matrix_filtered <- gene_matrix[, genes_to_keep_tfidf]
 df_filtered <- df[df >= min_mutations]
 
-# 4. Calculate the IDF Weights
+# Calculate the IDF Weights
 idf_weights <- log(N / df_filtered)
 
-# 5. Apply weights (TF * IDF)
-# sweep() multiplies each column in the matrix by its corresponding IDF weight
+# Apply weights (TF * IDF)
 # If patient = 1 (mutated), they get 1 * IDF_weight. If 0, they get 0.
 gene_matrix_weighted <- sweep(
   x = gene_matrix_filtered, 
@@ -71,10 +69,10 @@ gene_matrix_weighted <- sweep(
   FUN = "*"
 )
 
-# 6. Recombine with clinical data
+# Recombine with clinical data
 nsclc_tfidf <- bind_cols(nsclc[, clinical_cols], gene_matrix_weighted)
 
-# Check your results
+# Check results
 cat("Total patients (N):", N, "\n")
 cat("Genes evaluated:", length(gene_cols), "\n")
 cat("Genes kept for TF-IDF (>= 3 mutations):", length(genes_to_keep_tfidf), "\n")
@@ -83,19 +81,14 @@ cat("Genes kept for TF-IDF (>= 3 mutations):", length(genes_to_keep_tfidf), "\n"
 ### Data Preparation for glmnet
 
 ```{r}
-library(glmnet)
-
-# 1. Isolate the predictor variables
+# Isolate the predictor variables
 x_vars <- nsclc_tfidf %>% 
   select(-X, -PATIENT_ID, -entry_time, -exit_time, -event)
 
-# 2. Create the predictor matrix
-# The '~ . - 1' tells R to create dummy variables for your factors but omit the intercept
-# (Cox models don't use a standard intercept in the x matrix)
+# Create the predictor matrix
 x_matrix <- model.matrix(~ . - 1, data = x_vars)
 
-# 3. Create the Survival response object
-# glmnet accepts standard Surv() objects for the 'cox' family
+# Create the Survival response object
 y_surv <- Surv(
   time = nsclc_tfidf$entry_time, 
   time2 = nsclc_tfidf$exit_time, 
@@ -106,20 +99,18 @@ y_surv <- Surv(
 ### data cleaning
 
 ```{r}
-library(tidyr)
 
-# 1. Create a complete dataset with NO missing values
-# This guarantees x and y will be perfectly aligned
+# Create a complete dataset with NO missing values
 nsclc_complete <- nsclc_tfidf %>% drop_na()
 
-# 2. Isolate the predictor variables from the COMPLETE dataset
+# Isolate the predictor variables from the COMPLETE dataset
 x_vars <- nsclc_complete %>% 
   select(-X, -PATIENT_ID, -entry_time, -exit_time, -event)
 
-# 3. Create the predictor matrix
+# Create the predictor matrix
 x_matrix <- model.matrix(~ . - 1, data = x_vars)
 
-# 4. Create the Survival response object from the SAME complete dataset
+# Create the Survival response object from the SAME complete dataset
 y_surv <- Surv(
   time = nsclc_complete$entry_time, 
   time2 = nsclc_complete$exit_time, 
@@ -139,15 +130,14 @@ cv_lasso_cox <- cv.glmnet(
   x = x_matrix,
   y = y_surv,
   family = "cox",
-  alpha = 1,          # alpha = 1 specifies LASSO (alpha = 0 would be Ridge)
-  type.measure = "C"  # Optimize the penalty to maximize the Harrell's C-index
+  alpha = 1,          
+  type.measure = "C"  
 )
 
 # Plot the cross-validation curve
-# This shows the C-index on the y-axis against the log(lambda) penalty on the x-axis
 plot(cv_lasso_cox)
 
-# Print the performance metrics
+# Print performance 
 cat("Optimal Lambda (maximizes C-index):", cv_lasso_cox$lambda.min, "\n")
 cat("Max Cross-Validated C-index:", max(cv_lasso_cox$cvm, na.rm = TRUE), "\n")
 ```
@@ -171,12 +161,10 @@ print(selected_weights)
 ### Post-LASSO unpenalized Cox model.
 
 ```{r}
-# 1. Identify ONLY the genes that LASSO selected
-# We do this by cross-referencing the active features with your original gene list
+# Identify only the genes that LASSO selected
 selected_genes <- active_features[active_features %in% gene_cols]
 
-# 2. Build a new dataframe using the ORIGINAL clinical columns + the winning genes
-# This brings back your proper factor variables (stage_f, prior_med_f, etc.)
+# Build a new dataframe using the ORIGINAL clinical columns + the winning genes
 final_model_data_clean <- nsclc_complete %>%
   select(
     entry_time, exit_time, event,   # Survival outcomes
@@ -184,14 +172,13 @@ final_model_data_clean <- nsclc_complete %>%
     all_of(selected_genes)          # Winning genes
   )
 
-# 3. Run the final Cox model
-# R will automatically handle the dummy coding behind the scenes
+# Run the final Cox model
 clean_cox_model <- coxph(
   Surv(entry_time, exit_time, event) ~ .,
   data = final_model_data_clean
 )
 
-# Check the beautiful, NA-free output
+# Check output
 summary(clean_cox_model)
 ```
 
@@ -199,7 +186,6 @@ summary(clean_cox_model)
 ### c-index
 
 ```{r}
-
 # Setup CV
 set.seed(629)
 K <- 5
@@ -241,7 +227,6 @@ cat("Post-LASSO SD C-index:", sd(cv_cindex_post_lasso, na.rm = TRUE), "\n")
 ### calibration plot:
 
 ```{r}
-library(ggplot2)
 
 # Define the time horizon (e.g., 80th percentile of follow-up time)
 time_horizon <- quantile(final_model_data_clean$exit_time, 0.80)
@@ -293,26 +278,23 @@ ggplot(calibration_data, aes(x = mean_pred, y = km_est)) +
 ### Time-Dependent ROC Curve
 
 ```{r}
-library(timeROC)
-
-# 1. Generate the risk scores (linear predictors) from your final model
-# We use the clean model and dataset from the previous step
+# Generate the risk scores (linear predictors) from your final model
 final_model_data_clean$risk_score <- predict(clean_cox_model, type = "lp")
 
-# 2. Define the time horizon (same as your calibration plot)
+# Define the time horizon (same as your calibration plot)
 time_horizon <- quantile(final_model_data_clean$exit_time, 0.80)
 
-# 3. Calculate the Time-dependent ROC
+#  Calculate the Time-dependent ROC
 roc_post_lasso <- timeROC(
   T = final_model_data_clean$exit_time,
   delta = final_model_data_clean$event,
   marker = final_model_data_clean$risk_score, 
   cause = 1,
   times = time_horizon,
-  iid = TRUE # Keeps the data needed to calculate Confidence Intervals
+  iid = TRUE 
 )
 
-# 4. Extract the Area Under the Curve (AUC) and Confidence Intervals
+# Extract the Area Under the Curve (AUC) and Confidence Intervals
 auc_value <- roc_post_lasso$AUC[2] # Index 2 corresponds to the time_horizon we passed
 se_value <- roc_post_lasso$inference$vect_sd_1[2]
 
@@ -324,18 +306,14 @@ cat("Time Horizon:", round(time_horizon, 2), "\n")
 cat("AUC at Time Horizon:", round(auc_value, 3), "\n")
 cat("95% CI: [", round(ci_lower, 3), "-", round(ci_upper, 3), "]\n\n")
 
-# 5. Plot the ROC Curve
+# Plot the ROC Curve
 {plot(roc_post_lasso, 
      time = time_horizon, 
      col = "darkblue", 
      lwd = 2, 
      title = FALSE)
-
-# Add a reference line and a title
 abline(0, 1, lty = 2, col = "gray50")
 title(main = paste("Post-LASSO Cox Model ROC\nat Time =", round(time_horizon, 1)))
-
-# Add a legend with the AUC value
 legend("bottomright", 
        legend = paste0("AUC = ", round(auc_value, 2), 
                        " (", round(ci_lower, 2), "-", round(ci_upper, 2), ")"),
@@ -349,11 +327,7 @@ legend("bottomright",
 ### prepare the data by excluding the gene with frequency <= 1% (to reduce overfitting and increase interpretability)
 
 ```{r}
-library(dplyr)
-library(LTRCtrees) 
-library(tidyr)
-
-# 1. Define clinical columns to isolate the gene matrix
+# Define clinical columns to isolate the gene matrix
 clinical_cols <- c(
   "X", "PATIENT_ID", "age_at_diagnosis",  "event", 
   "entry_time", "exit_time", "smoke_f", "stage_f", "prior_med_to_msk_f", 
@@ -442,7 +416,7 @@ test_prob_obj <- predictProb(
 test_complete$pred_surv <- as.numeric(test_prob_obj$survival.probs)
 test_complete$risk_score <- 1 - test_complete$pred_surv
 
-# --- A. C-index (Concordance) on TEST ---
+# C-index on testing set
 c_obj <- concordance(
   Surv(entry_time, exit_time, event) ~ risk_score,
   data = test_complete,
@@ -483,8 +457,7 @@ legend("bottomright",
 ### Calibration Plot on testing set
 
 ```{r}
-# Note: Using 5 deciles (quintiles) instead of 10, as the test set is 20% of the total size.
-# This prevents unstable Kaplan-Meier estimates caused by bins having too few events.
+# Using 5 deciles 
 test_complete$decile <- ntile(test_complete$pred_surv, 5)
 
 calibration_data_rf_tfidf <- test_complete %>%

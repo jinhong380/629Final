@@ -67,9 +67,6 @@ cat("Genes dropped:", length(gene_cols) - length(genes_to_keep), "\n")
 ### cox ph model:
 
 ```{r}
-library(tidyr)
-library(glmnet)
-
 # Drop missing values so x and y matrices align perfectly
 nsclc_filtered_complete <- nsclc_filtered %>% drop_na()
 
@@ -157,10 +154,6 @@ cat("Frequency Pipeline SD C-index:", sd(cv_cindex_freq, na.rm = TRUE), "\n")
 ### calibration visualization
 
 ```{r}
-library(ggplot2)
-library(dplyr)
-library(survival)
-
 # 1. Define the time horizon (80th percentile of follow-up time)
 # Make sure to use the exit_time from your frequency dataset
 time_horizon_freq <- quantile(final_data_freq$exit_time, 0.80)
