@@ -1,9 +1,9 @@
 # MSK-CHORD NSCLC Survival Analysis
 
 ## Overview
-This repository contains the code, data processing pipelines, and modeling results for our final project. The project investigates the predictive value of rare gene mutations on long-term survival in Non-Small Cell Lung Cancer (NSCLC) patients using the MSK-CHORD dataset. 
+This repository contains the code, data processing pipelines, and modeling results for my final project. The project investigates the predictive value of rare gene mutations on long-term survival in Non-Small Cell Lung Cancer (NSCLC) patients using the MSK-CHORD dataset. 
 
-We compare traditional linear models (Lasso-Cox) with non-linear machine learning approach (Random Survival Forests) across three feature engineering strategies to handle rare mutations.
+I compare traditional linear models (Lasso-Cox) with non-linear machine learning approach (Random Survival Forests) across three feature engineering strategies to handle rare mutations.
 
 ## Project Website
 **To view the project website, directly open the `website/docs/index.html` file in a web browser.**
